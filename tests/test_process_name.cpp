@@ -5,6 +5,7 @@
 
 int main() {
     using Hooks::GetCreateProcessTargetBaseNameA;
+    using Hooks::IsAntigravityHostProcessName;
     using Hooks::IsLanguageServerProcessName;
 
     // lpApplicationName 明确给出路径时，不按空格截断文件名。
@@ -32,6 +33,13 @@ int main() {
     assert(IsLanguageServerProcessName("language_server"));
     assert(IsLanguageServerProcessName("language_server_windows_x64.exe"));
     assert(!IsLanguageServerProcessName("Antigravity IDE.exe"));
+
+    // Electron 主程序及其同名子进程只负责继续注入，不安装网络 Hook，
+    // 避免破坏 UI 与 language server 之间的本机自签名 HTTPS/gRPC。
+    assert(IsAntigravityHostProcessName("Antigravity.exe"));
+    assert(IsAntigravityHostProcessName("ANTIGRAVITY IDE.EXE"));
+    assert(!IsAntigravityHostProcessName("language_server.exe"));
+    assert(!IsAntigravityHostProcessName("node.exe"));
 
     return 0;
 }

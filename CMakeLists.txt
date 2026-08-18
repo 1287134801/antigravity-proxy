@@ -91,9 +91,15 @@ endif()
 add_library(version SHARED ${SOURCES_MINHOOK} ${SOURCES_HDE} ${SOURCES_PROXY} ${RESOURCES})
 
 # 设置模块定义文件 (导出 version.dll 函数)
-set_target_properties(version PROPERTIES
-  LINK_FLAGS "/DEF:\"${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/version.def\""
-)
+if(MSVC)
+  set_target_properties(version PROPERTIES
+    LINK_FLAGS "/DEF:\"${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/version.def\""
+  )
+else()
+  target_link_options(version PRIVATE
+    "-Wl,${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/version.def"
+  )
+endif()
 
 target_include_directories(version PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/>
@@ -105,6 +111,10 @@ target_include_directories(version PRIVATE "src/hde/")
 
 # Link WS2_32 / WinHTTP
 target_link_libraries(version PRIVATE ws2_32 winhttp)
+
+if(NOT MSVC AND STATIC_RUNTIME)
+  target_link_options(version PRIVATE -static-libstdc++ -static-libgcc)
+endif()
 
 # Build Antigravity CLI shim (输出名为 dbghelp.dll)
 add_library(dbghelp SHARED

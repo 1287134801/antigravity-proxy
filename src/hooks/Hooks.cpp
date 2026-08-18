@@ -4366,13 +4366,14 @@ int WSAAPI DetourWSASendTo(
 // ============= Hook 管理 =============
 
 namespace Hooks {
-    void Install() {
+    void Install(bool enableNetworkHooks) {
         if (MH_Initialize() != MH_OK) {
             Core::Logger::Error("MinHook 初始化失败");
             return;
         }
         
         // ===== Phase 1: 网络 Hooks =====
+        if (enableNetworkHooks) {
         
         // Hook connect
         if (MH_CreateHookApi(L"ws2_32.dll", "connect", 
@@ -4435,6 +4436,7 @@ namespace Hooks {
                              (LPVOID)DetourWSAGetOverlappedResult, (LPVOID*)&fpWSAGetOverlappedResult) != MH_OK) {
             Core::Logger::Error("Hook WSAGetOverlappedResult 失败");
         }
+        }
         
         // ===== Phase 2: 进程创建 Hook =====
         
@@ -4450,6 +4452,7 @@ namespace Hooks {
             Core::Logger::Error("Hook CreateProcessA 失败");
         }
         
+        if (enableNetworkHooks) {
         // Hook GetQueuedCompletionStatus (ConnectEx 完成握手)
         if (MH_CreateHookApi(L"kernel32.dll", "GetQueuedCompletionStatus",
                              (LPVOID)DetourGetQueuedCompletionStatus, (LPVOID*)&fpGetQueuedCompletionStatus) != MH_OK) {
@@ -4507,11 +4510,14 @@ namespace Hooks {
                              (LPVOID)DetourWSARecvFrom, (LPVOID*)&fpWSARecvFrom) != MH_OK) {
             Core::Logger::Error("Hook WSARecvFrom 失败");
         }
+        }
         
         if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
             Core::Logger::Error("启用 Hooks 失败");
         } else {
-            Core::Logger::Info("所有 API Hook 安装成功 (Phase 1-3)");
+            Core::Logger::Info(enableNetworkHooks
+                ? "所有 API Hook 安装成功 (Phase 1-3)"
+                : "注入器 Hook 安装成功 (仅 CreateProcessA/W，网络 Hook 已跳过)");
         }
     }
     

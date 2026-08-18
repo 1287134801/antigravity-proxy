@@ -10,11 +10,12 @@
 #include <string>
 #include "core/Config.hpp"
 #include "core/Logger.hpp"
+#include "hooks/ProcessName.hpp"
 #include "update/UpdateChecker.hpp"
 
 // 前向声明
 namespace Hooks {
-    void Install();
+    void Install(bool enableNetworkHooks);
     void Uninstall();
 }
 
@@ -24,6 +25,13 @@ namespace VersionProxy {
 }
 
 namespace {
+    static std::string GetCurrentProcessBaseName() {
+        char processPath[MAX_PATH] = {0};
+        const DWORD len = GetModuleFileNameA(NULL, processPath, MAX_PATH);
+        if (len == 0 || len >= MAX_PATH) return "Unknown";
+        return Hooks::ExtractBaseNameFromPathLike(processPath);
+    }
+
     struct LoadNotifyPayload {
         bool success;
         bool askOpenLogs;
@@ -197,8 +205,15 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             break;
         }
 
-        // 安装 Hooks（必须及时安装以确保网络流量被正确拦截）
-        Hooks::Install();
+        // Antigravity 的 Electron 网络服务子进程与主程序同名，也会通过 DLL 搜索顺序
+        // 自动加载本 DLL。它们只需保留 CreateProcess Hook 以继续注入 language server；
+        // 对这些进程安装 Winsock/IOCP Hook 会破坏 UI 与 language server 的本机自签名 TLS。
+        const std::string processName = GetCurrentProcessBaseName();
+        const bool enableNetworkHooks = !Hooks::IsAntigravityHostProcessName(processName);
+        if (!enableNetworkHooks) {
+            Core::Logger::Info("当前进程 " + processName + " 使用注入器模式：仅安装进程创建 Hook，跳过网络 Hook");
+        }
+        Hooks::Install(enableNetworkHooks);
         MaybeShowLoadNotifyAsync(true);
         // 更新检查默认关闭；启用后也只在后台异步提示，不阻塞 Hook 安装主流程。
         UpdateChecker::StartAsync();
