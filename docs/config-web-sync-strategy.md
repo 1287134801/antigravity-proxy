@@ -12,6 +12,7 @@
   - `fake_ip.enabled / fake_ip.cidr`
   - `timeout.connect / timeout.send / timeout.recv`
   - `traffic_logging`
+  - `diagnostics.agent_ip_probe`
   - `child_injection / child_injection_mode / child_injection_exclude[] / target_processes[]`
   - `proxy_rules.allowed_ports[]`
   - `proxy_rules.dns_mode / ipv6_mode / udp_mode / udp_fallback`
@@ -61,4 +62,3 @@
 - 自检结果：页面启动后无 `schemaDrift` 告警。
 - 可导出性：无校验错误时可导出 JSON。
 - 兼容性：暗黑/亮色正常，移动端触控目标满足可点击尺寸。
-

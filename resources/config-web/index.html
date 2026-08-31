@@ -323,6 +323,22 @@
                   </label>
                   <div class="field-error" data-error-for="traffic_logging"></div>
                 </div>
+
+                <div class="field">
+                  <label class="field-label">
+                    <span class="font-mono">diagnostics.agent_ip_probe</span>
+                    <span class="tip">
+                      <i class="fa-solid fa-circle-info"></i>
+                      <span class="tip-pop">作用：排查 location/eligibility 问题时探测代理出口 IP，并关联 Antigravity 日志。影响：开启后会访问外部 IP 查询服务。建议：仅在定位地域问题时开启。</span>
+                    </span>
+                  </label>
+                  <label class="toggle">
+                    <input type="checkbox" data-bind="diagnostics.agent_ip_probe" />
+                    <span class="toggle-ui"></span>
+                    <span class="text-sm text-slate-700 dark:text-slate-200">启用</span>
+                  </label>
+                  <div class="field-error" data-error-for="diagnostics.agent_ip_probe"></div>
+                </div>
               </fieldset>
             </div>
           </section>
@@ -653,10 +669,11 @@
                     <span class="font-mono">proxy_rules.udp_mode</span>
                     <span class="tip">
                       <i class="fa-solid fa-circle-info"></i>
-                      <span class="tip-pop">作用：定义 UDP 流量行为。取值：block/direct/proxy。影响：direct 可能绕过代理；proxy 依赖上游支持 UDP Associate。建议：国内必须代理场景优先 block。</span>
+                      <span class="tip-pop">作用：定义 UDP 流量行为。取值：auto/block/direct/proxy。auto 在 SOCKS5 下使用 UDP Associate，在 HTTP 下按 fallback 处理。建议：保持 auto。</span>
                     </span>
                   </label>
                   <select id="udp_mode" class="field-input" data-bind="proxy_rules.udp_mode">
+                    <option value="auto">auto</option>
                     <option value="block">block</option>
                     <option value="direct">direct</option>
                     <option value="proxy">proxy</option>
@@ -669,7 +686,7 @@
                     <span class="font-mono">proxy_rules.udp_fallback</span>
                     <span class="tip">
                       <i class="fa-solid fa-circle-info"></i>
-                      <span class="tip-pop">作用：定义 UDP 代理失败后的处理。取值：block/direct（仅 udp_mode=proxy 生效）。影响：direct 提高可用性但有直连泄漏风险。建议：默认 block。</span>
+                      <span class="tip-pop">作用：定义 UDP 代理失败或 auto 遇到 HTTP 代理时的处理。取值：block/direct。影响：direct 提高可用性但有直连泄漏风险。建议：默认 block。</span>
                     </span>
                   </label>
                   <select id="udp_fallback" class="field-input" data-bind="proxy_rules.udp_fallback">
@@ -1230,7 +1247,7 @@
           <div class="grid grid-cols-1 gap-3 md:grid-cols-2">
             <button class="preset-card" type="button" data-preset="default">
               <div class="preset-title">默认配置</div>
-              <div class="preset-desc">log_level=info；allowed_ports=[80,443]；udp_mode=block；示例 target_processes</div>
+              <div class="preset-desc">log_level=info；allowed_ports=[80,443]；udp_mode=auto；示例 target_processes</div>
             </button>
             <button class="preset-card" type="button" data-preset="global_proxy">
               <div class="preset-title">全局代理</div>
@@ -1543,6 +1560,9 @@
             ],
           },
           traffic_logging: false,
+          diagnostics: {
+            agent_ip_probe: false,
+          },
           child_injection: true,
           child_injection_mode: "filtered",
           child_injection_exclude: [],
@@ -1551,7 +1571,7 @@
             allowed_ports: [80, 443],
             dns_mode: "direct",
             ipv6_mode: "proxy",
-            udp_mode: "block",
+            udp_mode: "auto",
             udp_fallback: "block",
             routing: {
               enabled: true,
@@ -1647,6 +1667,11 @@
 
           // phase2/3
           out.traffic_logging = normalizeBool(j.traffic_logging, base.traffic_logging);
+          const diagnostics = j.diagnostics && typeof j.diagnostics === "object" ? j.diagnostics : {};
+          out.diagnostics.agent_ip_probe = normalizeBool(
+            diagnostics.agent_ip_probe,
+            base.diagnostics.agent_ip_probe
+          );
           out.child_injection = normalizeBool(j.child_injection, base.child_injection);
           out.child_injection_mode = normalizeEnum(j.child_injection_mode, ["filtered", "inherit"], base.child_injection_mode);
           out.child_injection_exclude = Array.isArray(j.child_injection_exclude)
@@ -1663,7 +1688,7 @@
             : deepClone(base.proxy_rules.allowed_ports);
           out.proxy_rules.dns_mode = normalizeEnum(pr.dns_mode, ["direct", "proxy"], base.proxy_rules.dns_mode);
           out.proxy_rules.ipv6_mode = normalizeEnum(pr.ipv6_mode, ["proxy", "direct", "block"], base.proxy_rules.ipv6_mode);
-          out.proxy_rules.udp_mode = normalizeEnum(pr.udp_mode, ["block", "direct", "proxy"], base.proxy_rules.udp_mode);
+          out.proxy_rules.udp_mode = normalizeEnum(pr.udp_mode, ["auto", "block", "direct", "proxy"], base.proxy_rules.udp_mode);
           out.proxy_rules.udp_fallback = normalizeEnum(pr.udp_fallback, ["block", "direct"], base.proxy_rules.udp_fallback);
 
           const rt = pr.routing && typeof pr.routing === "object" ? pr.routing : {};
@@ -1720,6 +1745,7 @@
           "timeout",
           "updates",
           "traffic_logging",
+          "diagnostics",
           "child_injection",
           "child_injection_mode",
           "child_injection_exclude",
@@ -1756,6 +1782,7 @@
           "updates.allow_insecure_mirrors",
           "updates.mirrors[]",
           "traffic_logging",
+          "diagnostics.agent_ip_probe",
           "child_injection",
           "child_injection_mode",
           "child_injection_exclude[]",
@@ -1800,6 +1827,7 @@
           "updates.notify_once",
           "updates.allow_insecure_mirrors",
           "traffic_logging",
+          "diagnostics.agent_ip_probe",
           "child_injection",
           "child_injection_mode",
           "proxy_rules.dns_mode",
@@ -1924,6 +1952,7 @@
             "updates.allow_insecure_mirrors",
             "updates.mirrors",
             "traffic_logging",
+            "diagnostics.agent_ip_probe",
             "child_injection",
             "child_injection_mode",
             "child_injection_exclude",
@@ -1977,6 +2006,8 @@
           // scalar
           out.log_level = state.form.log_level;
           out.traffic_logging = !!state.form.traffic_logging;
+          const outDiagnostics = ensureObjIn(out, "diagnostics");
+          outDiagnostics.agent_ip_probe = !!state.form.diagnostics.agent_ip_probe;
           out.child_injection = !!state.form.child_injection;
           out.child_injection_mode = state.form.child_injection_mode;
           out.child_injection_exclude = deepClone(state.form.child_injection_exclude);
@@ -2100,6 +2131,9 @@
 
           // phase2/3 scalar
           if (typeof state.form.traffic_logging !== "boolean") err("traffic_logging", "必须为布尔值");
+          if (typeof state.form.diagnostics.agent_ip_probe !== "boolean") {
+            err("diagnostics.agent_ip_probe", "必须为布尔值");
+          }
           if (typeof state.form.child_injection !== "boolean") err("child_injection", "必须为布尔值");
 
           // child injection mode
@@ -2128,10 +2162,16 @@
           // enums
           if (!["direct", "proxy"].includes(state.form.proxy_rules.dns_mode)) err("proxy_rules.dns_mode", "必须为 direct/proxy");
           if (!["proxy", "direct", "block"].includes(state.form.proxy_rules.ipv6_mode)) err("proxy_rules.ipv6_mode", "必须为 proxy/direct/block");
-          if (!["block", "direct", "proxy"].includes(state.form.proxy_rules.udp_mode)) err("proxy_rules.udp_mode", "必须为 block/direct/proxy");
+          if (!["auto", "block", "direct", "proxy"].includes(state.form.proxy_rules.udp_mode)) err("proxy_rules.udp_mode", "必须为 auto/block/direct/proxy");
           if (!["block", "direct"].includes(state.form.proxy_rules.udp_fallback)) err("proxy_rules.udp_fallback", "必须为 block/direct");
-          if (state.form.proxy_rules.udp_mode !== "proxy" && state.form.proxy_rules.udp_fallback !== "block") {
-            warn("proxy_rules.udp_fallback", "仅 udp_mode=proxy 时生效；当前该设置不会生效");
+          if (!["auto", "proxy"].includes(state.form.proxy_rules.udp_mode) && state.form.proxy_rules.udp_fallback !== "block") {
+            warn("proxy_rules.udp_fallback", "仅 udp_mode=auto/proxy 时生效；当前该设置不会生效");
+          }
+          if (state.form.proxy_rules.udp_mode === "auto" && state.form.proxy.type !== "socks5") {
+            warn("proxy_rules.udp_mode", `auto 在 HTTP 代理下会按 udp_fallback=${state.form.proxy_rules.udp_fallback} 处理`);
+          }
+          if (state.form.proxy_rules.udp_mode === "proxy" && state.form.proxy.type !== "socks5") {
+            warn("proxy_rules.udp_mode", "proxy 模式依赖 SOCKS5 UDP Associate；当前代理类型不匹配");
           }
 
           // routing bools

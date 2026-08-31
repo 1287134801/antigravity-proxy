@@ -35,6 +35,7 @@
   - `fake_ip`：`{ enabled, cidr }`
   - `timeout`：`{ connect, send, recv }`（毫秒）
   - `traffic_logging`：布尔
+  - `diagnostics`：`{ agent_ip_probe }`（默认关闭的出口 IP/location 联合诊断）
   - `child_injection`：布尔
   - `child_injection_mode`：`filtered/inherit`
   - `child_injection_exclude`：字符串数组
@@ -43,8 +44,8 @@
     - `allowed_ports`：端口白名单数组（空数组=全部端口）
     - `dns_mode`：`direct/proxy`
     - `ipv6_mode`：`proxy/direct/block`
-    - `udp_mode`：`block/direct/proxy`
-    - `udp_fallback`：`block/direct`（仅 `udp_mode=proxy` 时生效）
+    - `udp_mode`：`auto/block/direct/proxy`
+    - `udp_fallback`：`block/direct`（`udp_mode=auto/proxy` 时生效）
     - `routing`：
       - `enabled`
       - `priority_mode`：`order/number`

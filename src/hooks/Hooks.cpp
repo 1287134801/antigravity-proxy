@@ -26,6 +26,7 @@
 #include "../network/Socks5Udp.hpp"
 #include "../network/HttpConnect.hpp"
 #include "../network/SocketIo.hpp"
+#include "../network/SocketFamily.hpp"
 #include "../network/TrafficMonitor.hpp"
 #include "../injection/ProcessInjector.hpp"
 #include "ProcessName.hpp"
@@ -36,6 +37,9 @@ using Hooks::ToLowerAsciiCopy;
 
 // ============= 函数指针类型定义 =============
 typedef int (WSAAPI *connect_t)(SOCKET, const struct sockaddr*, int);
+typedef SOCKET (WSAAPI *socket_t)(int, int, int);
+typedef SOCKET (WSAAPI *WSASocketA_t)(int, int, int, LPWSAPROTOCOL_INFOA, GROUP, DWORD);
+typedef SOCKET (WSAAPI *WSASocketW_t)(int, int, int, LPWSAPROTOCOL_INFOW, GROUP, DWORD);
 typedef int (WSAAPI *WSAConnect_t)(SOCKET, const struct sockaddr*, int, LPWSABUF, LPWSABUF, LPQOS, LPQOS);
 typedef struct hostent* (WSAAPI *gethostbyname_t)(const char* name);
 typedef int (WSAAPI *getaddrinfo_t)(PCSTR, PCSTR, const ADDRINFOA*, PADDRINFOA*);
@@ -69,6 +73,9 @@ typedef BOOL (WINAPI *GetQueuedCompletionStatusEx_t)(
 
 // ============= 原始函数指针 =============
 connect_t fpConnect = NULL;
+socket_t fpSocket = NULL;
+WSASocketA_t fpWSASocketA = NULL;
+WSASocketW_t fpWSASocketW = NULL;
 WSAConnect_t fpWSAConnect = NULL;
 gethostbyname_t fpGetHostByName = NULL;
 getaddrinfo_t fpGetAddrInfo = NULL;
@@ -220,6 +227,57 @@ static std::once_flag g_runtimeConfigLogOnce;
 static std::once_flag g_languageServerNodeCompatLogOnce;
 // IP/日志联合诊断只需要在主 Antigravity 进程里启动一次。
 static std::once_flag g_agentIpDiagnosisThreadOnce;
+
+static Core::UdpAction GetEffectiveUdpAction(const Core::Config& config) {
+    return Core::ResolveUdpAction(
+        config.rules.udp_mode,
+        config.proxy.type,
+        config.rules.udp_fallback);
+}
+
+static std::string GetUdpPolicyLabel(const Core::Config& config) {
+    return "udp_mode=" + config.rules.udp_mode +
+           ", effective=" + Core::UdpActionName(GetEffectiveUdpAction(config));
+}
+
+static void ConfigureCreatedSocketForProxy(SOCKET socket, int addressFamily, const char* api) {
+    if (socket == INVALID_SOCKET || addressFamily != AF_INET6) return;
+    auto& config = Core::Config::Instance();
+    if (config.proxy.port == 0 || config.rules.ipv6_mode != "proxy") return;
+
+    int error = 0;
+    const Network::DualStackResult result =
+        Network::EnsureIpv6DualStack(socket, addressFamily, &error);
+    if (result == Network::DualStackResult::Failed) {
+        Core::Logger::Warn(std::string(api) +
+                           ": IPv6 socket 启用 dual-stack 失败, sock=" +
+                           std::to_string((unsigned long long)socket) +
+                           ", WSA错误码=" + std::to_string(error));
+    } else if (result == Network::DualStackResult::Enabled &&
+               Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
+        Core::Logger::Debug(std::string(api) +
+                            ": 已为代理模式启用 IPv6 dual-stack, sock=" +
+                            std::to_string((unsigned long long)socket));
+    }
+}
+
+static bool PrepareIpv4MappedProxyDestination(SOCKET socket, const sockaddr_in6& destination) {
+    if (!Network::IsIpv4MappedAddress(destination)) return true;
+
+    int error = 0;
+    const Network::DualStackResult result =
+        Network::EnsureIpv6DualStack(socket, AF_INET6, &error);
+    if (result != Network::DualStackResult::Failed) return true;
+
+    const int finalError = error != 0 ? error : WSAEAFNOSUPPORT;
+    Core::Logger::Error(
+        "IPv6 socket 仍为 v6-only，不能连接 v4-mapped 代理端点；"
+        "请确保 socket 在 bind 前允许 dual-stack, sock=" +
+        std::to_string((unsigned long long)socket) +
+        ", WSA错误码=" + std::to_string(finalError));
+    WSASetLastError(finalError);
+    return false;
+}
 
 static std::string WideToUtf8(PCWSTR input) {
     if (!input) return "";
@@ -1478,6 +1536,13 @@ static bool EnsureUdpProxyReady(
         }
     }
 
+    if (relayForSock.ss_family == AF_INET6 &&
+        !PrepareIpv4MappedProxyDestination(
+            udpSock,
+            *reinterpret_cast<const sockaddr_in6*>(&relayForSock))) {
+        return false;
+    }
+
     int rc = fpConnect ? fpConnect(udpSock, (sockaddr*)&relayForSock, relayForSockLen)
                        : connect(udpSock, (sockaddr*)&relayForSock, relayForSockLen);
     if (rc != 0) {
@@ -1976,7 +2041,7 @@ BOOL PASCAL DetourConnectEx(
 static bool ShouldProxyUdpByRule(const sockaddr* name, const std::string& originalHost, uint16_t originalPort) {
     auto& config = Core::Config::Instance();
     if (config.proxy.port == 0) return false;
-    if (config.rules.udp_mode != "proxy") return false;
+    if (GetEffectiveUdpAction(config) != Core::UdpAction::Proxy) return false;
 
     // loopback 永远直连（避免递归与本地调试端口被误伤）
     if (IsSockaddrLoopback(name) || IsLoopbackHost(originalHost)) return false;
@@ -2168,6 +2233,18 @@ static BOOL PerformProxyUdpConnectEx(
         }
         return FALSE;
     }
+    if (relayForSock.ss_family == AF_INET6 &&
+        !PrepareIpv4MappedProxyDestination(
+            s,
+            *reinterpret_cast<const sockaddr_in6*>(&relayForSock))) {
+        if (config.rules.udp_fallback == "direct") {
+            CleanupUdpProxyContext(s);
+            return originalConnectEx(
+                s, name, namelen, lpSendBuffer, dwSendDataLength,
+                lpdwBytesSent, lpOverlapped);
+        }
+        return FALSE;
+    }
 
     // 注意：不能把原始 lpSendBuffer 透传给 ConnectEx，否则应用会把“未封装的 UDP payload”发给 relay
     DWORD ignoredBytes = 0;
@@ -2282,9 +2359,9 @@ int PerformProxyConnect(SOCKET s, const struct sockaddr* name, int namelen, bool
         if (soType != SOCK_STREAM) {
 
             if (soType == SOCK_DGRAM) {
-                // UDP 强阻断：默认阻断 UDP（除 DNS/loopback 例外），强制应用回退到 TCP 再走代理
-                // 设计意图：解决国内环境 QUIC/HTTP3(UDP) 绕过代理导致“看似已建隧道但仍不可用”的问题。
-                if (config.rules.udp_mode == "block") {
+                // 有效策略为 block 时阻断 UDP（DNS/loopback 例外），促使应用回退到 TCP。
+                const Core::UdpAction udpAction = GetEffectiveUdpAction(config);
+                if (udpAction == Core::UdpAction::Block) {
                     uint16_t dstPort = 0;
                     const bool hasPort = TryGetSockaddrPort(name, &dstPort);
                     const bool allowUdp = IsSockaddrLoopback(name) || (hasPort && dstPort == 53);
@@ -2293,7 +2370,7 @@ int PerformProxyConnect(SOCKET s, const struct sockaddr* name, int namelen, bool
                         if (ShouldLogUdpBlock()) {
                             const std::string api = isWsa ? "WSAConnect" : "connect";
                             const std::string dst = SockaddrToString(name);
-                            Core::Logger::Warn(api + ": 已阻止 UDP 连接(策略: udp_mode=block, 说明: 禁用 QUIC/HTTP3), sock=" + std::to_string((unsigned long long)s) +
+                            Core::Logger::Warn(api + ": 已阻止 UDP 连接(策略: " + GetUdpPolicyLabel(config) + "), sock=" + std::to_string((unsigned long long)s) +
                                                (dst.empty() ? "" : ", dst=" + dst) +
                                                (hasPort ? (", port=" + std::to_string(dstPort)) : std::string("")) +
                                                ", WSA错误码=" + std::to_string(err));
@@ -2311,11 +2388,11 @@ int PerformProxyConnect(SOCKET s, const struct sockaddr* name, int namelen, bool
                 }
 
                 // UDP 走代理：用于 QUIC/HTTP3（通过 SOCKS5 UDP Associate）
-                if (config.rules.udp_mode == "proxy") {
+                if (udpAction == Core::UdpAction::Proxy) {
                     return PerformProxyUdpConnect(s, name, namelen, isWsa);
                 }
 
-                // udp_mode=direct：保持直连
+                // 有效策略为 direct：保持直连
                 return isWsa ? fpWSAConnect(s, name, namelen, NULL, NULL, NULL, NULL) : fpConnect(s, name, namelen);
             }
 
@@ -2492,6 +2569,9 @@ int PerformProxyConnect(SOCKET s, const struct sockaddr* name, int namelen, bool
                 WSASetLastError(WSAEINVAL);
                 return SOCKET_ERROR;
             }
+            if (!PrepareIpv4MappedProxyDestination(s, proxyAddr6)) {
+                return SOCKET_ERROR;
+            }
             result = isWsa ?
                 fpWSAConnect(s, (sockaddr*)&proxyAddr6, sizeof(proxyAddr6), NULL, NULL, NULL, NULL) :
                 fpConnect(s, (sockaddr*)&proxyAddr6, sizeof(proxyAddr6));
@@ -2535,6 +2615,36 @@ int PerformProxyConnect(SOCKET s, const struct sockaddr* name, int namelen, bool
 }
 
 // ============= Phase 1: 网络 Hook 函数实现 =============
+
+SOCKET WSAAPI DetourSocket(int addressFamily, int type, int protocol) {
+    const SOCKET socket = fpSocket(addressFamily, type, protocol);
+    ConfigureCreatedSocketForProxy(socket, addressFamily, "socket");
+    return socket;
+}
+
+SOCKET WSAAPI DetourWSASocketA(
+    int addressFamily,
+    int type,
+    int protocol,
+    LPWSAPROTOCOL_INFOA protocolInfo,
+    GROUP group,
+    DWORD flags) {
+    const SOCKET socket = fpWSASocketA(addressFamily, type, protocol, protocolInfo, group, flags);
+    ConfigureCreatedSocketForProxy(socket, addressFamily, "WSASocketA");
+    return socket;
+}
+
+SOCKET WSAAPI DetourWSASocketW(
+    int addressFamily,
+    int type,
+    int protocol,
+    LPWSAPROTOCOL_INFOW protocolInfo,
+    GROUP group,
+    DWORD flags) {
+    const SOCKET socket = fpWSASocketW(addressFamily, type, protocol, protocolInfo, group, flags);
+    ConfigureCreatedSocketForProxy(socket, addressFamily, "WSASocketW");
+    return socket;
+}
 
 int WSAAPI DetourConnect(SOCKET s, const struct sockaddr* name, int namelen) {
     return PerformProxyConnect(s, name, namelen, false);
@@ -3007,9 +3117,9 @@ BOOL PASCAL DetourConnectEx(
         if (soType != SOCK_STREAM) {
 
             if (soType == SOCK_DGRAM) {
-                // UDP 强阻断：默认阻断 UDP（除 DNS/loopback 例外），强制应用回退到 TCP 再走代理
-                // 说明：ConnectEx 可能被 QUIC/HTTP3 等用于 UDP，这里需要覆盖其行为。
-                if (config.rules.udp_mode == "block") {
+                // ConnectEx 也按统一有效策略处理 UDP，避免遗漏 QUIC/HTTP3 路径。
+                const Core::UdpAction udpAction = GetEffectiveUdpAction(config);
+                if (udpAction == Core::UdpAction::Block) {
                     uint16_t dstPort = 0;
                     const bool hasPort = TryGetSockaddrPort(name, &dstPort);
                     const bool allowUdp = IsSockaddrLoopback(name) || (hasPort && dstPort == 53);
@@ -3017,7 +3127,7 @@ BOOL PASCAL DetourConnectEx(
                         const int err = WSAEACCES;
                         if (ShouldLogUdpBlock()) {
                             const std::string dst = SockaddrToString(name);
-                            Core::Logger::Warn("ConnectEx: 已阻止 UDP 连接(策略: udp_mode=block, 说明: 禁用 QUIC/HTTP3), sock=" + std::to_string((unsigned long long)s) +
+                            Core::Logger::Warn("ConnectEx: 已阻止 UDP 连接(策略: " + GetUdpPolicyLabel(config) + "), sock=" + std::to_string((unsigned long long)s) +
                                                (dst.empty() ? "" : ", dst=" + dst) +
                                                (hasPort ? (", port=" + std::to_string(dstPort)) : std::string("")) +
                                                ", WSA错误码=" + std::to_string(err));
@@ -3034,11 +3144,11 @@ BOOL PASCAL DetourConnectEx(
                 }
 
                 // UDP 走代理：通过 SOCKS5 UDP Associate 转发（用于 QUIC/HTTP3）
-                if (config.rules.udp_mode == "proxy") {
+                if (udpAction == Core::UdpAction::Proxy) {
                     return PerformProxyUdpConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength, lpdwBytesSent, lpOverlapped, originalConnectEx);
                 }
 
-                // udp_mode=direct：保持直连
+                // 有效策略为 direct：保持直连
                 return originalConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength, lpdwBytesSent, lpOverlapped);
             }
 
@@ -3202,6 +3312,9 @@ BOOL PASCAL DetourConnectEx(
         sockaddr_in6 proxyAddr6{};
         if (!BuildProxyAddrV6(config.proxy, &proxyAddr6, (sockaddr_in6*)name)) {
             WSASetLastError(WSAEINVAL);
+            return FALSE;
+        }
+        if (!PrepareIpv4MappedProxyDestination(s, proxyAddr6)) {
             return FALSE;
         }
         result = originalConnectEx(s, (sockaddr*)&proxyAddr6, sizeof(proxyAddr6), NULL, 0,
@@ -3627,7 +3740,7 @@ int WSAAPI DetourSend(SOCKET s, const char* buf, int len, int flags) {
     auto& config = Core::Config::Instance();
 
     // UDP/QUIC：若该 UDP socket 已进入 udp_mode=proxy，则需要封装为 SOCKS5 UDP 报文
-    if (config.proxy.port != 0 && config.rules.udp_mode == "proxy") {
+    if (config.proxy.port != 0 && GetEffectiveUdpAction(config) == Core::UdpAction::Proxy) {
         int soType = 0;
         if (TryGetSocketType(s, &soType) && soType == SOCK_DGRAM) {
             std::string host;
@@ -3667,7 +3780,7 @@ int WSAAPI DetourRecv(SOCKET s, char* buf, int len, int flags) {
     auto& config = Core::Config::Instance();
 
     // UDP/QUIC：若该 UDP socket 已进入 udp_mode=proxy，则 recv 得到的是 SOCKS5 UDP Reply，需要解封装
-    if (config.proxy.port != 0 && config.rules.udp_mode == "proxy") {
+    if (config.proxy.port != 0 && GetEffectiveUdpAction(config) == Core::UdpAction::Proxy) {
         int soType = 0;
         if (TryGetSocketType(s, &soType) && soType == SOCK_DGRAM) {
             sockaddr_storage relay{};
@@ -3716,7 +3829,7 @@ int WSAAPI DetourWSASend(
     auto& config = Core::Config::Instance();
 
     // UDP/QUIC：connected UDP socket 可能走 WSASend，需要封装 SOCKS5 UDP 头
-    if (config.proxy.port != 0 && config.rules.udp_mode == "proxy") {
+    if (config.proxy.port != 0 && GetEffectiveUdpAction(config) == Core::UdpAction::Proxy) {
         int soType = 0;
         if (TryGetSocketType(s, &soType) && soType == SOCK_DGRAM) {
             std::string host;
@@ -3815,7 +3928,7 @@ int WSAAPI DetourWSARecv(
     auto& config = Core::Config::Instance();
 
     // UDP/QUIC：connected UDP socket 可能走 WSARecv，需要解封装 SOCKS5 UDP Reply
-    if (config.proxy.port != 0 && config.rules.udp_mode == "proxy") {
+    if (config.proxy.port != 0 && GetEffectiveUdpAction(config) == Core::UdpAction::Proxy) {
         int soType = 0;
         if (TryGetSocketType(s, &soType) && soType == SOCK_DGRAM) {
             sockaddr_storage relay{};
@@ -3917,7 +4030,7 @@ int WSAAPI DetourRecvFrom(SOCKET s, char* buf, int len, int flags, struct sockad
     }
 
     auto& config = Core::Config::Instance();
-    if (config.proxy.port != 0 && config.rules.udp_mode == "proxy") {
+    if (config.proxy.port != 0 && GetEffectiveUdpAction(config) == Core::UdpAction::Proxy) {
         int soType = 0;
         if (TryGetSocketType(s, &soType) && soType == SOCK_DGRAM) {
             sockaddr_storage relay{};
@@ -3975,7 +4088,7 @@ int WSAAPI DetourWSARecvFrom(
     }
 
     auto& config = Core::Config::Instance();
-    if (config.proxy.port != 0 && config.rules.udp_mode == "proxy") {
+    if (config.proxy.port != 0 && GetEffectiveUdpAction(config) == Core::UdpAction::Proxy) {
         int soType = 0;
         if (TryGetSocketType(s, &soType) && soType == SOCK_DGRAM) {
             sockaddr_storage relay{};
@@ -4097,8 +4210,8 @@ int WSAAPI DetourSendTo(SOCKET s, const char* buf, int len, int flags, const str
                 }
             }
 
-            // udp_mode=block：保持旧行为
-            if (config.rules.udp_mode == "block") {
+            const Core::UdpAction udpAction = GetEffectiveUdpAction(config);
+            if (udpAction == Core::UdpAction::Block) {
                 uint16_t dstPort = 0;
                 const bool hasPort = TryGetSockaddrPort(dst, &dstPort);
                 const bool allowUdp = dst && (IsSockaddrLoopback(dst) || (hasPort && dstPort == 53));
@@ -4106,7 +4219,7 @@ int WSAAPI DetourSendTo(SOCKET s, const char* buf, int len, int flags, const str
                     const int err = WSAEACCES;
                     if (ShouldLogUdpBlock()) {
                         const std::string dstStr = dst ? SockaddrToString(dst) : std::string("(未知)");
-                        Core::Logger::Warn("sendto: 已阻止 UDP 发送(策略: udp_mode=block, 说明: 禁用 QUIC/HTTP3), sock=" + std::to_string((unsigned long long)s) +
+                        Core::Logger::Warn("sendto: 已阻止 UDP 发送(策略: " + GetUdpPolicyLabel(config) + "), sock=" + std::to_string((unsigned long long)s) +
                                            ", dst=" + dstStr +
                                            (hasPort ? (", port=" + std::to_string(dstPort)) : std::string("")) +
                                            ", WSA错误码=" + std::to_string(err));
@@ -4117,8 +4230,8 @@ int WSAAPI DetourSendTo(SOCKET s, const char* buf, int len, int flags, const str
                 return fpSendTo(s, buf, len, flags, to, tolen);
             }
 
-            // udp_mode=proxy：封装为 SOCKS5 UDP 报文并发给 relay
-            if (config.rules.udp_mode == "proxy") {
+            // 有效策略为 proxy：封装为 SOCKS5 UDP 报文并发给 relay
+            if (udpAction == Core::UdpAction::Proxy) {
                 std::string host;
                 uint16_t port = 0;
                 int family = AF_INET;
@@ -4212,8 +4325,8 @@ int WSAAPI DetourWSASendTo(
                 }
             }
 
-            // udp_mode=block：保持旧行为
-            if (config.rules.udp_mode == "block") {
+            const Core::UdpAction udpAction = GetEffectiveUdpAction(config);
+            if (udpAction == Core::UdpAction::Block) {
                 uint16_t dstPort = 0;
                 const bool hasPort = TryGetSockaddrPort(dst, &dstPort);
                 const bool allowUdp = dst && (IsSockaddrLoopback(dst) || (hasPort && dstPort == 53));
@@ -4224,7 +4337,7 @@ int WSAAPI DetourWSASendTo(
                     }
                     if (ShouldLogUdpBlock()) {
                         const std::string dstStr = dst ? SockaddrToString(dst) : std::string("(未知)");
-                        Core::Logger::Warn("WSASendTo: 已阻止 UDP 发送(策略: udp_mode=block, 说明: 禁用 QUIC/HTTP3), sock=" + std::to_string((unsigned long long)s) +
+                        Core::Logger::Warn("WSASendTo: 已阻止 UDP 发送(策略: " + GetUdpPolicyLabel(config) + "), sock=" + std::to_string((unsigned long long)s) +
                                            ", dst=" + dstStr +
                                            (hasPort ? (", port=" + std::to_string(dstPort)) : std::string("")) +
                                            ", WSA错误码=" + std::to_string(err));
@@ -4235,8 +4348,8 @@ int WSAAPI DetourWSASendTo(
                 return fpWSASendTo(s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags, lpTo, iToLen, lpOverlapped, lpCompletionRoutine);
             }
 
-            // udp_mode=proxy：封装为 SOCKS5 UDP 报文并发给 relay
-            if (config.rules.udp_mode == "proxy") {
+            // 有效策略为 proxy：封装为 SOCKS5 UDP 报文并发给 relay
+            if (udpAction == Core::UdpAction::Proxy) {
                 std::string host;
                 uint16_t port = 0;
                 int family = AF_INET;
@@ -4375,6 +4488,20 @@ namespace Hooks {
         // ===== Phase 1: 网络 Hooks =====
         if (enableNetworkHooks) {
         
+        // 在 socket 创建且尚未 bind 时启用 IPv6 dual-stack，支持连接 IPv4 本地代理。
+        if (MH_CreateHookApi(L"ws2_32.dll", "socket",
+                             (LPVOID)DetourSocket, (LPVOID*)&fpSocket) != MH_OK) {
+            Core::Logger::Error("Hook socket 失败");
+        }
+        if (MH_CreateHookApi(L"ws2_32.dll", "WSASocketA",
+                             (LPVOID)DetourWSASocketA, (LPVOID*)&fpWSASocketA) != MH_OK) {
+            Core::Logger::Error("Hook WSASocketA 失败");
+        }
+        if (MH_CreateHookApi(L"ws2_32.dll", "WSASocketW",
+                             (LPVOID)DetourWSASocketW, (LPVOID*)&fpWSASocketW) != MH_OK) {
+            Core::Logger::Error("Hook WSASocketW 失败");
+        }
+
         // Hook connect
         if (MH_CreateHookApi(L"ws2_32.dll", "connect", 
                              (LPVOID)DetourConnect, (LPVOID*)&fpConnect) != MH_OK) {

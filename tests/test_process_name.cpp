@@ -1,3 +1,7 @@
+// 回归测试在 Release 构建下也必须执行断言。
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <cassert>
 #include <string>
 

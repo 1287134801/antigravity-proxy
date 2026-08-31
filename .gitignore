@@ -58,4 +58,5 @@ build-x86/
 build-tests/
 build-process-name-tests/
 build-codex-x64/
+build-compatibility-tests*/
 .codex-tools/

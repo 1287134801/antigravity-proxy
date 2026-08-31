@@ -290,10 +290,27 @@ if (-not (Test-Path $OutputDir)) {
     New-Item -ItemType Directory -Path $OutputDir | Out-Null
 }
 
-Copy-Item $dllPath.FullName -Destination $OutputDir -Force
-Write-Success "DLL 已复制到 output 目录"
-Copy-Item $dbghelpPath.FullName -Destination $OutputDir -Force
-Write-Success "CLI dbghelp.dll 已复制到 output 目录"
+$IdeOutputDir = Join-Path $OutputDir "ide"
+$CliOutputDir = Join-Path $OutputDir "cli"
+
+# 每次重建两个部署目录，避免旧版根目录 DLL 残留后继续诱导混装。
+foreach ($deploymentDir in @($IdeOutputDir, $CliOutputDir)) {
+    if (Test-Path -LiteralPath $deploymentDir) {
+        Remove-Item -LiteralPath $deploymentDir -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $deploymentDir | Out-Null
+}
+Get-ChildItem -LiteralPath $OutputDir -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match '^(version|dbghelp|antigravity_proxy).*\.dll$' -or $_.Name -eq 'config.json' } |
+    Remove-Item -Force
+
+Copy-Item $dllPath.FullName -Destination (Join-Path $IdeOutputDir "version.dll") -Force
+Write-Success "IDE 代理 DLL 已复制到 output\ide"
+
+# CLI 主体使用唯一名称，避免与系统 version.dll 的已加载模块发生冲突。
+Copy-Item $dllPath.FullName -Destination (Join-Path $CliOutputDir "antigravity_proxy.dll") -Force
+Copy-Item $dbghelpPath.FullName -Destination (Join-Path $CliOutputDir "dbghelp.dll") -Force
+Write-Success "CLI shim 与代理主体已复制到 output\cli"
 
 # ============================================================
 # 步骤 8: 生成配置文件
@@ -342,6 +359,10 @@ $configJson = @{
         )
     }
     traffic_logging = $false
+    # 地域/资格排障时可显式开启；默认不访问外部 IP 查询服务
+    diagnostics = @{
+        agent_ip_probe = $false
+    }
     child_injection = $true
     # 子进程注入模式: filtered(按target_processes过滤) / inherit(注入所有子进程)
     child_injection_mode = "filtered"
@@ -355,9 +376,9 @@ $configJson = @{
         allowed_ports = @(80, 443)
         dns_mode = "direct"
         ipv6_mode = "proxy"
-        # UDP策略: block(阻断UDP以强制回退TCP) / direct(直连) / proxy(UDP走代理, 需 SOCKS5 UDP Associate)
-        udp_mode = "block"
-        # UDP代理失败降级策略(仅udp_mode=proxy时生效): block(失败即阻断) / direct(失败回退直连)
+        # UDP策略: auto(SOCKS5自动代理) / block(阻断) / direct(直连) / proxy(强制SOCKS5代理)
+        udp_mode = "auto"
+        # UDP代理失败或auto遇到HTTP代理时的策略: block(阻断) / direct(回退直连)
         udp_fallback = "block"
         # 高级路由规则（内网自动直连，无需手动配置）
         routing = @{
@@ -370,9 +391,14 @@ $configJson = @{
     }
 } | ConvertTo-Json -Depth 5
 
-$configPath = Join-Path $OutputDir "config.json"
-$configJson | Out-File -FilePath $configPath -Encoding UTF8
-Write-Success "配置文件已生成: $configPath"
+$configPaths = @(
+    (Join-Path $IdeOutputDir "config.json"),
+    (Join-Path $CliOutputDir "config.json")
+)
+foreach ($configPath in $configPaths) {
+    $configJson | Out-File -FilePath $configPath -Encoding UTF8
+    Write-Success "配置文件已生成: $configPath"
+}
 
 # ============================================================
 # 步骤 9: 生成使用说明
@@ -406,7 +432,7 @@ FAILED_PRECONDITION (code 400): User location is not supported for the API use.
 - 当前代理出口 IP 的国家/ASN/机房属性，被 Antigravity agent mode / Gemini CLI 路径判定为不可用
 - 也就是说：**国家支持不等于当前这条 agent 执行链路一定接受这条出口 IP**
 
-当前版本开始，DLL 会额外输出诊断日志：
+设置 `diagnostics.agent_ip_probe=true` 后，DLL 会额外输出诊断日志：
 - `[诊断/IP] 当前代理出口探测完成: ...`
 - `[诊断/IP] 当前代理出口呈现机房/托管特征...`
 - `[诊断/IP] 最新 Antigravity 日志已命中 location 限制错误，同时当前代理出口呈现机房/托管特征...`
@@ -419,13 +445,11 @@ FAILED_PRECONDITION (code 400): User location is not supported for the API use.
 
 ## 快速开始
 
-### 1. 部署文件
-将以下文件复制到目标程序的目录：
-- ` version.dll ` (编译生成的 DLL)
-- ` dbghelp.dll ` (Antigravity CLI 的 agy.exe 需要)
-- ` config.json ` (配置文件)
+### 1. 选择部署目录
+- Antigravity 桌面端/IDE：只复制 `output/ide` 内的 `version.dll` 与 `config.json`。
+- Antigravity CLI：只复制 `output/cli` 内的 `dbghelp.dll`、`antigravity_proxy.dll` 与 `config.json`。
 
-Antigravity CLI 需要把 `dbghelp.dll`、`version.dll` 和 `config.json` 放到 `agy.exe` 同级目录；Antigravity 桌面端/IDE 仍只需要 `version.dll` 和 `config.json`。
+两个目录不得混合复制。CLI shim 会延迟加载唯一名称的 `antigravity_proxy.dll`，桌面端不需要 `dbghelp.dll`。
 
 ### 2. 配置代理
 编辑 `config.json`，设置代理服务器地址：
@@ -447,6 +471,9 @@ Antigravity CLI 需要把 `dbghelp.dll`、`version.dll` 和 `config.json` 放到
         "recv": 5000               // 接收超时 (毫秒)
     },
     "traffic_logging": false,      // 是否记录流量日志 (调试用)
+    "diagnostics": {
+        "agent_ip_probe": false    // 开启后探测代理出口 IP，并关联 location 日志
+    },
     "child_injection": true,       // 是否自动注入子进程
     "child_injection_mode": "filtered",  // 子进程注入模式: filtered(按target_processes过滤) / inherit(注入所有)
     "child_injection_exclude": [],       // 子进程注入排除列表 (大小写不敏感，支持子串匹配)
@@ -455,8 +482,8 @@ Antigravity CLI 需要把 `dbghelp.dll`、`version.dll` 和 `config.json` 放到
         "allowed_ports": [80, 443],  // 端口白名单: 仅代理 HTTP/HTTPS，空数组=代理所有端口
         "dns_mode": "direct",        // DNS策略: direct(直连) 或 proxy(走代理)
         "ipv6_mode": "proxy",        // IPv6策略: proxy(走代理) / direct(直连) / block(阻止)
-        "udp_mode": "block",         // UDP策略: block(阻断UDP以强制回退TCP) / direct(直连) / proxy(UDP走代理, 需 SOCKS5 UDP Associate)
-        "udp_fallback": "block",     // UDP代理失败降级策略(仅udp_mode=proxy生效): block(阻断) / direct(回退直连)
+        "udp_mode": "auto",          // UDP策略: auto(SOCKS5自动代理) / block(阻断) / direct(直连) / proxy(强制SOCKS5代理)
+        "udp_fallback": "block",     // UDP代理失败或auto遇到HTTP代理时: block(阻断) / direct(回退直连)
         "routing": {                 // 高级路由规则 (内网自动直连，一般无需配置)
             "enabled": true,
             "priority_mode": "order",
@@ -505,6 +532,7 @@ Test-NetConnection -ComputerName 127.0.0.1 -Port 7890
 | timeout.send | 发送超时 (毫秒) | 5000 |
 | timeout.recv | 接收超时 (毫秒) | 5000 |
 | traffic_logging | 是否记录流量日志 | false |
+| diagnostics.agent_ip_probe | 是否启用出口 IP/location 联合诊断 | false |
 | child_injection | 是否注入子进程 | true |
 | child_injection_mode | 子进程注入模式 (filtered/inherit) | filtered |
 | child_injection_exclude | 子进程注入排除列表 | [] |
@@ -512,7 +540,7 @@ Test-NetConnection -ComputerName 127.0.0.1 -Port 7890
 | proxy_rules.allowed_ports | 端口白名单 (空=全部代理) | [80, 443] |
 | proxy_rules.dns_mode | DNS策略 (direct/proxy) | direct |
 | proxy_rules.ipv6_mode | IPv6策略 (proxy/direct/block) | proxy |
-| proxy_rules.udp_mode | UDP策略 (block/direct/proxy) | block |
+| proxy_rules.udp_mode | UDP策略 (auto/block/direct/proxy) | auto |
 | proxy_rules.udp_fallback | UDP代理失败降级策略 (block/direct) | block |
 | proxy_rules.routing.enabled | 是否启用路由分流 | true |
 | proxy_rules.routing.priority_mode | 规则优先级模式 (order/number) | order |
@@ -530,8 +558,8 @@ Test-NetConnection -ComputerName 127.0.0.1 -Port 7890
    - `allowed_ports`: 仅指定端口走代理，其他直连
    - `dns_mode`: DNS (53端口) 可选直连或走代理
    - `ipv6_mode`: IPv6 可选走代理/直连/阻止
-   - `udp_mode`: UDP 可选直连/阻断/走代理（默认阻断以强制回退 TCP；若需要 QUIC/HTTP3，请使用 proxy 并确保代理端支持 SOCKS5 UDP Associate）
-   - `udp_fallback`: UDP 代理失败时的降级策略（仅 `udp_mode=proxy` 生效，默认阻断以防止流量泄漏）
+   - `udp_mode`: 默认 auto；SOCKS5 自动使用 UDP Associate，HTTP 代理按 udp_fallback 处理
+   - `udp_fallback`: UDP 代理失败或 auto 遇到非 SOCKS5 代理时的策略，默认阻断以防止流量泄漏
 
 ### 配置示例
 ```json
@@ -638,9 +666,10 @@ Write-Host ""
 Write-Host "输出目录: $OutputDir" -ForegroundColor Green
 Write-Host ""
 Write-Host "生成的文件:" -ForegroundColor White
-Get-ChildItem $OutputDir | ForEach-Object {
-    Write-Host "  - $($_.Name)" -ForegroundColor Gray
+Get-ChildItem $OutputDir -Recurse -File | ForEach-Object {
+    $relativePath = $_.FullName.Substring($OutputDir.Length).TrimStart('\')
+    Write-Host "  - $relativePath" -ForegroundColor Gray
 }
 Write-Host ""
-Write-Host "下一步: 将 output 目录中的文件复制到目标程序目录即可使用。" -ForegroundColor Yellow
+Write-Host "下一步: 桌面端复制 output\ide；CLI 复制 output\cli。请勿混装两个目录。" -ForegroundColor Yellow
 Write-Host ""

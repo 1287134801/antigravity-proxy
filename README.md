@@ -66,7 +66,7 @@
 - `SOCKS5: 隧道建立成功, 目标=oauth2.googleapis.com:443`
 - `SOCKS5: 隧道建立成功, 目标=daily-cloudcode-pa.googleapis.com:443`
 
-从当前版本开始，DLL 还会额外输出 IP 诊断日志：
+在配置页开启 `diagnostics.agent_ip_probe` 后，DLL 会额外输出 IP 诊断日志：
 - `[诊断/IP] 当前代理出口探测完成: ...`
 - `[诊断/IP] 当前代理出口呈现机房/托管特征...`
 - `[诊断/IP] 最新 Antigravity 日志已命中 location 限制错误，同时当前代理出口呈现机房/托管特征...`
@@ -222,18 +222,19 @@ curl -x http://127.0.0.1:7890 https://www.google.com -I
 
 ### Step 2: 准备文件 / Get the Files
 
-准备以下文件：
-- `version.dll`
-- `dbghelp.dll`（仅 Antigravity CLI 需要）
-- `config.json`
+Release 包按运行目标分成两个目录：
+- `ide/`：`version.dll`、`config.json`
+- `cli/`：`dbghelp.dll`、`antigravity_proxy.dll`、`config.json`
 
 （可以从 Release 下载，或自行编译生成。）
 
 ### Step 3: 部署到 Antigravity / Deploy to Antigravity
 
-把 `version.dll` 和 `config.json` 复制到 **Antigravity 主程序目录**（与 `Antigravity.exe` 同级）。然后启动 Antigravity，搞定。
+桌面端只复制 `ide/` 内的文件到 **Antigravity 主程序目录**（与 `Antigravity.exe` 同级）。
 
-如果使用 **Antigravity CLI**，把 `dbghelp.dll`、`version.dll` 和 `config.json` 复制到 `agy.exe` 同级目录。`agy.exe` 会加载同目录 `dbghelp.dll`，再由它加载 `version.dll`，不需要额外启动器。
+如果使用 **Antigravity CLI**，只复制 `cli/` 内的文件到 `agy.exe` 同级目录。`dbghelp.dll` 会在导出函数首次调用时加载唯一名称的 `antigravity_proxy.dll`，避开系统 `version.dll` 同名冲突。
+
+> `ide/` 与 `cli/` 不要混合复制；桌面端不需要 `dbghelp.dll`。
 
 #### Antigravity 2.0 注意事项
 
@@ -337,7 +338,7 @@ cd "$env:TEMP\antigravity-proxy-logs"
 | `所有 API Hook 安装成功` | Hook 生效 | ✅ 正常 |
 | `ConnectEx Hook 已安装` | 异步连接 Hook 成功 | ✅ 正常 |
 | `SOCKS5: 隧道建立成功` | 代理连接成功 | ✅ 正常 |
-| `非 SOCK_STREAM socket 直连, soType=2` | UDP 未走代理（`udp_mode=direct` 或未启用 UDP 代理） | ⚠️ 视配置而定 |
+| `非 SOCK_STREAM socket 直连, soType=2` | UDP 有效策略为 direct，或该端口未命中代理规则 | ⚠️ 视配置而定 |
 | `SOCKS5 握手失败` | 代理握手失败 | ❌ 需排查 |
 | `连接代理服务器失败` | 无法连接到代理 | ❌ 需排查 |
 | `WSA错误码=10061` | 连接被拒绝（代理未启动） | ❌ 需排查 |
@@ -469,7 +470,7 @@ Get-NetAdapterBinding -ComponentID ms_tcpip6
 
 | 问题 | 原因 | 解决方案 |
 |------|------|----------|
-| **大量 `非 SOCK_STREAM socket 直连, soType=2`** | UDP/QUIC 流量未走代理（`udp_mode=direct` 或 UDP 代理未生效） | 若需要 QUIC/HTTP3：设置 `udp_mode=proxy` + `proxy.type=socks5`，并确保代理端支持 SOCKS5 UDP Associate |
+| **大量 `非 SOCK_STREAM socket 直连, soType=2`** | UDP/QUIC 有效策略为 direct，或 UDP 代理未生效 | 优先使用 `udp_mode=auto` + `proxy.type=socks5`，并确认代理端支持 SOCKS5 UDP Associate |
 | **日志显示成功但网页打不开** | Clash 规则、节点问题 | 检查 Clash 日志 |
 | **某些请求绕过代理** | 应用使用了未 Hook 的 API | 提交 Issue 反馈 |
 | **360 等安全软件环境下失效** | LSP 注入干扰 | 添加白名单或卸载 |
@@ -721,9 +722,9 @@ target_link_libraries(version PRIVATE ws2_32)
 #### Step 1: 准备文件 / Prepare Files
 
 编译完成后，你会在 `output` 目录得到：
-- `version.dll` - 代理 DLL
-- `dbghelp.dll` - Antigravity CLI 劫持 DLL
-- `config.json` - 配置文件
+- `ide/version.dll` 与 `ide/config.json` - 桌面端部署目录
+- `cli/dbghelp.dll`、`cli/antigravity_proxy.dll` 与 `cli/config.json` - CLI 部署目录
+- `config-web.html` 与 `使用说明.md` - 配置工具和说明
 
 #### Step 2: 配置代理 / Configure Proxy
 
@@ -790,12 +791,13 @@ target_link_libraries(version PRIVATE ws2_32)
 | `timeout.recv` | int | `5000` | 接收超时 (毫秒) |
 | `child_injection` | bool | `true` | 是否注入子进程 |
 | `traffic_logging` | bool | `false` | 是否记录流量日志 |
+| `diagnostics.agent_ip_probe` | bool | `false` | 是否探测代理出口 IP 并关联 location 日志 |
 | `target_processes` | array | `[]` | 目标进程列表 (空=全部) |
 | `proxy_rules.allowed_ports` | array | `[80, 443]` | 端口白名单 (空=全部) |
 | `proxy_rules.dns_mode` | string | `"direct"` | DNS策略: `direct`(直连) / `proxy`(走代理) |
 | `proxy_rules.ipv6_mode` | string | `"proxy"` | IPv6策略: `proxy`(走代理) / `direct`(直连) / `block`(阻止) |
-| `proxy_rules.udp_mode` | string | `"block"` | UDP策略: `block`(阻断) / `direct`(直连) / `proxy`(走代理, 需 SOCKS5 UDP Associate) |
-| `proxy_rules.udp_fallback` | string | `"block"` | UDP 代理失败降级策略（仅 `udp_mode=proxy` 生效）: `block`(失败即阻断, 默认) / `direct`(失败回退直连, 有泄漏风险) |
+| `proxy_rules.udp_mode` | string | `"auto"` | UDP策略: `auto`(SOCKS5 自动代理) / `block` / `direct` / `proxy` |
+| `proxy_rules.udp_fallback` | string | `"block"` | UDP 代理失败或 auto 遇到非 SOCKS5 代理时: `block` / `direct` |
 | `proxy_rules.routing.enabled` | bool | `true` | 是否启用规则路由 |
 | `proxy_rules.routing.priority_mode` | string | `"order"` | 规则优先级: `order`(按顺序) / `number`(priority) |
 | `proxy_rules.routing.default_action` | string | `"proxy"` | 未命中时默认动作 |
@@ -847,19 +849,21 @@ target_link_libraries(version PRIVATE ws2_32)
 
 当日志出现 `SOCKS5: 读取认证响应失败, WSA错误码=10060`，且目标是 IPv6 地址（如 `2001:4860:4860::8888:443`），表示代理没有及时响应该 IPv6 连接。
 
+当前版本会在 IPv6 socket 创建且尚未 bind 时自动关闭 `IPV6_V6ONLY`，使 `127.0.0.1` 这类 IPv4 代理可通过 v4-mapped IPv6 地址连接。若应用之后重新启用 v6-only，日志会输出具体 WSA 错误码。
+
 可选处理方式：
-- **不改 host，快速止血**：将 `proxy_rules.ipv6_mode` 改为 `block`（阻止）或 `direct`（直连）。
-- **继续代理 IPv6**：让代理监听 `::1` 或开启双栈，再把 `proxy.host` 改为 `::1`（确保代理实际监听）。
+- **快速止血**：将 `proxy_rules.ipv6_mode` 改为 `block`（阻止）或 `direct`（直连）。
+- **原生 IPv6 代理**：让代理监听 `::1`，再把 `proxy.host` 改为 `::1`。
 
 **优先级说明**：当目标为纯 IPv6（非 v4-mapped）且 `proxy_rules.ipv6_mode` 为 `direct`/`block` 时，会在进入 `routing` 规则前直接直连/阻止；当 `ipv6_mode=proxy` 时才会继续进入 `routing` 匹配。
 
 ### UDP/QUIC 注意事项
 
-当目标程序使用 **QUIC/HTTP3**（UDP/443）时，必须开启 UDP 代理，否则会出现“TCP 走代理但 QUIC 直连/被阻断”的现象。
+当目标程序使用 **QUIC/HTTP3**（UDP/443）时，默认 `udp_mode=auto` 会在 SOCKS5 下自动使用 UDP Associate。
 
-启用方式：
-- 将 `proxy_rules.udp_mode` 设为 `proxy`
-- 将 `proxy.type` 设为 `socks5`（⚠️ HTTP 代理没有标准 UDP 转发能力）
+推荐配置：
+- 保持 `proxy_rules.udp_mode=auto`
+- 将 `proxy.type` 设为 `socks5`（HTTP 代理没有标准 UDP 转发能力）
 - 确保代理软件**支持 SOCKS5 UDP Associate** 并允许 UDP 转发（不同客户端/内核能力不同）
 - 可选：当代理不支持 UDP 时，可将 `proxy_rules.udp_fallback` 设为 `direct`（⚠️ 可能导致 UDP 直连泄漏；默认 `block` 更安全）
 
@@ -869,7 +873,7 @@ target_link_libraries(version PRIVATE ws2_32)
 {
   "proxy": { "host": "127.0.0.1", "port": 10808, "type": "socks5" },
   "proxy_rules": {
-    "udp_mode": "proxy",
+    "udp_mode": "auto",
     "dns_mode": "direct",
     "allowed_ports": [80, 443]
   }
@@ -878,8 +882,8 @@ target_link_libraries(version PRIVATE ws2_32)
 
 说明：
 - `dns_mode="direct"` 仍会放行 UDP/53（避免 DNS 超时）；若你希望 DNS 也走代理，请改为 `dns_mode="proxy"`。
-- 若日志出现“UDP 代理仅支持 SOCKS5 (UDP Associate)”：说明你配置了 `udp_mode=proxy` 但 `proxy.type` 不是 `socks5`，请修正配置。
-- `udp_mode="block"` 默认会阻断大部分 UDP，但仍放行 loopback 与 UDP/53 作为例外（避免影响本机通信与 DNS）。
+- `auto + socks5` 的有效策略为 proxy；`auto + http` 按 `udp_fallback` 决定 block/direct。
+- 显式 `udp_mode=block` 会阻断大部分 UDP，但仍放行 loopback 与 UDP/53。
 
 ### 验证是否生效 / Verification
 
@@ -893,7 +897,7 @@ target_link_libraries(version PRIVATE ws2_32)
 
 | 优先级 | 位置 | 说明 |
 |--------|------|------|
-| 1️⃣ | `<DLL所在目录>\logs\` | 与 `version.dll` 同级的 `logs` 子目录 |
+| 1️⃣ | `<DLL所在目录>\logs\` | 与代理主体 DLL 同级的 `logs` 子目录 |
 | 2️⃣ | `%TEMP%\antigravity-proxy-logs\` | 系统临时目录（通常为 `C:\Users\<用户名>\AppData\Local\Temp\antigravity-proxy-logs\`） |
 
 > 💡 **提示**：如果在 DLL 目录无法创建 `logs` 文件夹（例如权限不足），日志会自动回退到系统 TEMP 目录。

@@ -102,6 +102,30 @@ jobs:
           exit 1
         }
 
+        # 发布前强制校验 IDE/CLI 目录隔离，防止用户再次混装两套代理入口。
+        $requiredFiles = @(
+          "output\ide\version.dll",
+          "output\ide\config.json",
+          "output\cli\dbghelp.dll",
+          "output\cli\antigravity_proxy.dll",
+          "output\cli\config.json"
+        )
+        foreach ($requiredFile in $requiredFiles) {
+          if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
+            Write-Error "发布目录缺少必需文件: $requiredFile"
+            exit 1
+          }
+        }
+        if (Test-Path -LiteralPath "output\ide\dbghelp.dll") {
+          Write-Error "IDE 发布目录混入了 CLI 专用 dbghelp.dll"
+          exit 1
+        }
+        $rootDlls = @(Get-ChildItem -LiteralPath "output" -File -Filter "*.dll")
+        if ($rootDlls.Count -ne 0) {
+          Write-Error "output 根目录存在可混装 DLL: $($rootDlls.Name -join ', ')"
+          exit 1
+        }
+
         Compress-Archive -Path "output/*" -DestinationPath $zipPath -Force
         "zip_path=$zipPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 

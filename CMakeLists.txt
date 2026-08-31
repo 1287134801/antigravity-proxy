@@ -121,6 +121,26 @@ add_library(dbghelp SHARED
   "src/proxy/DbgHelpShim.cpp"
 )
 
+# CLI shim 通过定义文件导出常用 DbgHelp API，内部再延迟转发到系统 DLL。
+if(MSVC)
+  set_target_properties(dbghelp PROPERTIES
+    LINK_FLAGS "/DEF:\"${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/dbghelp.def\""
+  )
+else()
+  target_link_options(dbghelp PRIVATE
+    "-Wl,${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/dbghelp.def"
+  )
+endif()
+
+# CLI 使用唯一文件名加载代理主体，避免与已加载的系统 version.dll 同名冲突。
+add_dependencies(dbghelp version)
+add_custom_command(TARGET dbghelp POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          $<TARGET_FILE:version>
+          $<TARGET_FILE_DIR:dbghelp>/antigravity_proxy.dll
+  COMMENT "复制 Antigravity CLI 代理主体"
+)
+
 if(WIN32)
   set_target_properties(version PROPERTIES PREFIX "")
   set_target_properties(dbghelp PROPERTIES PREFIX "")
@@ -169,4 +189,32 @@ if(BUILD_TESTS)
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
   )
   add_test(NAME process_name_tests COMMAND process_name_tests)
+
+  add_executable(udp_policy_tests
+    "tests/test_udp_policy.cpp"
+  )
+  target_include_directories(udp_policy_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  )
+  add_test(NAME udp_policy_tests COMMAND udp_policy_tests)
+
+  add_executable(socket_family_tests
+    "tests/test_socket_family.cpp"
+  )
+  target_include_directories(socket_family_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  )
+  target_link_libraries(socket_family_tests PRIVATE ws2_32)
+  add_test(NAME socket_family_tests COMMAND socket_family_tests)
+
+  add_executable(dbghelp_shim_tests
+    "tests/test_dbghelp_shim.cpp"
+  )
+  # 使用真实 CLI 进程名覆盖 shim 的代理主体加载分支。
+  set_target_properties(dbghelp_shim_tests PROPERTIES OUTPUT_NAME "agy")
+  add_dependencies(dbghelp_shim_tests dbghelp)
+  add_test(
+    NAME dbghelp_shim_tests
+    COMMAND dbghelp_shim_tests "$<TARGET_FILE:dbghelp>"
+  )
 endif()

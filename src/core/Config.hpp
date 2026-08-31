@@ -13,6 +13,7 @@
 #include <string_view>
 #include <utility>
 #include "Logger.hpp"
+#include "UdpPolicy.hpp"
 
 namespace Core {
     struct ProxyConfig {
@@ -91,12 +92,13 @@ namespace Core {
         std::string ipv6_mode = "proxy";
 
         // UDP 处理策略
-        // "block"  - 阻断 UDP（默认，国内必须代理场景下可强制回退 TCP，避免 QUIC/HTTP3 绕过代理）
+        // "auto"   - SOCKS5 自动走 UDP Associate；其它代理按 udp_fallback 处理（默认）
+        // "block"  - 阻断 UDP，强制应用尝试回退 TCP
         // "direct" - UDP 直连（保持现状）
         // "proxy"  - UDP 走代理（需要代理端支持 SOCKS5 UDP Associate；用于 QUIC/HTTP3 等必须 UDP 的协议）
-        std::string udp_mode = "block";
+        std::string udp_mode = "auto";
 
-        // UDP 代理失败时的降级策略（仅当 udp_mode=proxy 时生效）
+        // UDP 代理失败或 auto 遇到非 SOCKS5 代理时的降级策略
         // "block"  - 失败即阻断（默认，避免 UDP 直连泄漏）
         // "direct" - 失败回退直连（风险更高，但可用于“代理不支持 UDP”时的兼容模式）
         std::string udp_fallback = "block";
@@ -924,11 +926,11 @@ namespace Core {
                                    [](unsigned char c) { return (char)std::tolower(c); });
                     if (rules.ipv6_mode.empty()) rules.ipv6_mode = "proxy";
                     // 解析 UDP 策略，统一为小写，避免大小写导致配置失效
-                    rules.udp_mode = pr.value("udp_mode", "block");
+                    rules.udp_mode = pr.value("udp_mode", "auto");
                     std::transform(rules.udp_mode.begin(), rules.udp_mode.end(),
                                    rules.udp_mode.begin(),
                                    [](unsigned char c) { return (char)std::tolower(c); });
-                    if (rules.udp_mode.empty()) rules.udp_mode = "block";
+                    if (rules.udp_mode.empty()) rules.udp_mode = "auto";
 
                     // 解析 UDP 代理失败降级策略
                     rules.udp_fallback = pr.value("udp_fallback", "block");
@@ -993,13 +995,20 @@ namespace Core {
                     Logger::Warn("配置: proxy_rules.ipv6_mode 无效(" + rules.ipv6_mode + ")，已回退为 proxy (可选: proxy/direct/block)");
                     rules.ipv6_mode = "proxy";
                 }
-                if (rules.udp_mode != "block" && rules.udp_mode != "direct" && rules.udp_mode != "proxy") {
-                    Logger::Warn("配置: proxy_rules.udp_mode 无效(" + rules.udp_mode + ")，已回退为 block (可选: block/direct/proxy)");
-                    rules.udp_mode = "block";
+                if (rules.udp_mode != "auto" && rules.udp_mode != "block" &&
+                    rules.udp_mode != "direct" && rules.udp_mode != "proxy") {
+                    Logger::Warn("配置: proxy_rules.udp_mode 无效(" + rules.udp_mode + ")，已回退为 auto (可选: auto/block/direct/proxy)");
+                    rules.udp_mode = "auto";
                 }
                 if (rules.udp_fallback != "block" && rules.udp_fallback != "direct") {
                     Logger::Warn("配置: proxy_rules.udp_fallback 无效(" + rules.udp_fallback + ")，已回退为 block (可选: block/direct)");
                     rules.udp_fallback = "block";
+                }
+                const UdpAction effectiveUdpAction =
+                    ResolveUdpAction(rules.udp_mode, proxy.type, rules.udp_fallback);
+                if (rules.udp_mode == "auto" && proxy.type != "socks5") {
+                    Logger::Warn("配置: udp_mode=auto 仅在 SOCKS5 下使用 UDP Associate；当前 proxy.type=" +
+                                 proxy.type + "，有效策略=" + UdpActionName(effectiveUdpAction));
                 }
                 rules.routing.priority_mode = ProxyRules::ToLower(rules.routing.priority_mode);
                 if (rules.routing.priority_mode != "order" && rules.routing.priority_mode != "number") {
@@ -1015,6 +1024,7 @@ namespace Core {
                 Logger::Info("路由规则: allowed_ports=" + std::to_string(rules.allowed_ports.size()) +
                              " 项, dns_mode=" + rules.dns_mode + ", ipv6_mode=" + rules.ipv6_mode +
                              ", udp_mode=" + rules.udp_mode + ", udp_fallback=" + rules.udp_fallback +
+                             ", udp_effective=" + UdpActionName(effectiveUdpAction) +
                              ", routing=" + std::string(rules.routing.enabled ? "on" : "off") +
                              ", routing_rules=" + std::to_string(rules.routing.rules.size()) +
                              (hasProxyRules ? "" : " (默认)"));
