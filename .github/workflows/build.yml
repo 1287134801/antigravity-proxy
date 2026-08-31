@@ -1,29 +1,40 @@
-name: Build
+name: CI Build
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
   pull_request:
-    branches: [ main, master ]
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    # 固定到 Windows 2022，避免 windows-latest 迁移到 VS 2026 后找不到 VS 2022 生成器
+    name: Build ${{ matrix.arch }} (IDE + CLI)
+    # 固定到 Windows 2022，避免 windows-latest 迁移后改变 VS 生成器环境。
     runs-on: windows-2022
-    
+    timeout-minutes: 30
+
     strategy:
+      fail-fast: false
       matrix:
         arch: [x64, x86]
 
     steps:
     - name: 检出仓库
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
 
-    # 从 build.ps1 读取版本号，确保产物命名与脚本一致
+    # 从 build.ps1 读取版本号，确保产物命名与脚本一致。
     - name: 读取版本号
       shell: pwsh
       run: |
-        $match = Select-String -Path .\build.ps1 -Pattern '^\s*\$Version\s*=\s*\"([^\"]+)\"'
+        $match = Select-String -Path .\build.ps1 -Pattern '^\s*\$Version\s*=\s*"([^"]+)"'
         if (-not $match) {
           Write-Error "未在 build.ps1 中找到版本号"
           exit 1
@@ -31,15 +42,29 @@ jobs:
         $version = $match.Matches[0].Groups[1].Value
         "BUILD_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-    # 使用 build.ps1 统一编译逻辑，保持与本地流程一致
-    - name: 执行编译脚本（Release，先清理）
+    # 每个架构只编译一次，共享代码同时生成 IDE 与 CLI 产物。
+    - name: 编译并运行回归测试
       shell: pwsh
-      run: .\build.ps1 -Clean -Config Release -Arch ${{ matrix.arch }}
+      run: .\build.ps1 -Clean -Config Release -Arch ${{ matrix.arch }} -RunTests
 
-    # 上传 output 目录的产物，便于下载验证
-    - name: 上传构建产物
-      uses: actions/upload-artifact@v4
+    - name: 上传 IDE 构建产物
+      uses: actions/upload-artifact@v7
       with:
-        name: antigravity-proxy-v${{ env.BUILD_VERSION }}-win-${{ matrix.arch }}
-        path: output/**
+        name: antigravity-proxy-v${{ env.BUILD_VERSION }}-ide-win-${{ matrix.arch }}
+        path: |
+          output/ide/**
+          output/config-web.html
+          output/使用说明.md
         if-no-files-found: error
+        retention-days: 7
+
+    - name: 上传 CLI 构建产物
+      uses: actions/upload-artifact@v7
+      with:
+        name: antigravity-proxy-v${{ env.BUILD_VERSION }}-cli-win-${{ matrix.arch }}
+        path: |
+          output/cli/**
+          output/config-web.html
+          output/使用说明.md
+        if-no-files-found: error
+        retention-days: 7

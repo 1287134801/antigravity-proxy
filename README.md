@@ -222,11 +222,11 @@ curl -x http://127.0.0.1:7890 https://www.google.com -I
 
 ### Step 2: 准备文件 / Get the Files
 
-Release 包按运行目标分成两个目录：
-- `ide/`：`version.dll`、`config.json`
-- `cli/`：`dbghelp.dll`、`antigravity_proxy.dll`、`config.json`
+Release 按架构和运行目标提供四个独立压缩包，下载时只选实际使用的一套：
+- `antigravity-proxy-vX-ide-win-x64.zip` / `...-x86.zip`：包含 `ide/`（`version.dll`、`config.json`）。
+- `antigravity-proxy-vX-cli-win-x64.zip` / `...-x86.zip`：包含 `cli/`（`dbghelp.dll`、`antigravity_proxy.dll`、`config.json`）。
 
-（可以从 Release 下载，或自行编译生成。）
+每个压缩包还包含通用的 `config-web.html` 与 `使用说明.md`；自行编译时仍会在本地 `output/ide`、`output/cli` 生成两套目录。
 
 ### Step 3: 部署到 Antigravity / Deploy to Antigravity
 
@@ -626,7 +626,10 @@ Get-NetAdapterBinding -ComponentID ms_tcpip6
 # 输出详细编译日志
 .\build.ps1 -Verbose
 
-# CI 场景显式声明跳过测试步骤
+# 构建并运行 CTest（CI/Release 使用）
+.\build.ps1 -RunTests
+
+# 显式声明跳过测试（也是默认行为）
 .\build.ps1 -SkipTests
 
 # 查看帮助

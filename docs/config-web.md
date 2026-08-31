@@ -5,8 +5,8 @@
 - **源码（开发态）**：`resources/config-web/index.html`
 - **构建输出（用户可直接打开）**：`output/config-web.html`
   - 由 `build.ps1` 在生成 `使用说明.md` 后复制得到（Step 10）
-- **Release 资产**：Release workflow 打包的是 `output/*`，因此 zip 内会包含 `config-web.html`
-  - `.github/workflows/release.yml` 在 `Compress-Archive` 前做了兜底复制与校验
+- **Release 资产**：`scripts/package-release.ps1` 会把 `config-web.html` 分别放入 IDE 与 CLI 独立压缩包
+  - `.github/workflows/release.yml` 每个架构只编译一次，再调用统一脚本生成两套互不混装的资产
 
 ## 使用方式（无需服务端）
 

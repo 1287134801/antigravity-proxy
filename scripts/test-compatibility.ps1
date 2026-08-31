@@ -37,6 +37,27 @@ function Assert-FileExists {
     }
 }
 
+function Get-ZipEntryNames {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($Path)
+    try {
+        return @($archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') })
+    } finally {
+        $archive.Dispose()
+    }
+}
+
+function Assert-ZipEntry {
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Entries,
+        [Parameter(Mandatory = $true)][string]$Expected
+    )
+    if ($Entries -notcontains $Expected) {
+        throw "压缩包缺少条目: $Expected"
+    }
+}
+
 Write-Host "[测试] 配置兼容性回归测试..."
 Invoke-Checked {
     cmake -S $Root -B $BuildPath -A $CMakeArch -DBUILD_TESTS=ON
@@ -97,10 +118,42 @@ if (-not $SkipReleaseLayout) {
     if ($configWeb -notmatch '<option value="auto">auto</option>') {
         throw "配置页缺少 udp_mode=auto 选项"
     }
+
+    Write-Host "[测试] 生成并检查 IDE/CLI 独立发布包..."
+    $PackageDir = Join-Path $BuildPath "release-packages"
+    & (Join-Path $Root "scripts\package-release.ps1") `
+        -Version "0.0.0" `
+        -Arch $Arch `
+        -OutputDir $Output `
+        -DestinationDir $PackageDir | Out-Host
+
+    $IdeZip = Join-Path $PackageDir "antigravity-proxy-v0.0.0-ide-win-$Arch.zip"
+    $CliZip = Join-Path $PackageDir "antigravity-proxy-v0.0.0-cli-win-$Arch.zip"
+    Assert-FileExists $IdeZip
+    Assert-FileExists $CliZip
+
+    $IdeEntries = Get-ZipEntryNames $IdeZip
+    Assert-ZipEntry $IdeEntries "ide/version.dll"
+    Assert-ZipEntry $IdeEntries "ide/config.json"
+    Assert-ZipEntry $IdeEntries "config-web.html"
+    Assert-ZipEntry $IdeEntries "使用说明.md"
+    if ($IdeEntries -match '(^|/)cli/' -or $IdeEntries -match 'dbghelp\.dll$' -or $IdeEntries -match 'antigravity_proxy\.dll$') {
+        throw "IDE 压缩包出现 CLI 专用文件"
+    }
+
+    $CliEntries = Get-ZipEntryNames $CliZip
+    Assert-ZipEntry $CliEntries "cli/dbghelp.dll"
+    Assert-ZipEntry $CliEntries "cli/antigravity_proxy.dll"
+    Assert-ZipEntry $CliEntries "cli/config.json"
+    Assert-ZipEntry $CliEntries "config-web.html"
+    Assert-ZipEntry $CliEntries "使用说明.md"
+    if ($CliEntries -match '(^|/)ide/' -or $CliEntries -match '(^|/)version\.dll$') {
+        throw "CLI 压缩包出现 IDE 专用文件"
+    }
 }
 
 if ($SkipReleaseLayout) {
     Write-Host "[测试] UDP/IPv6/DbgHelp 回归通过（已按参数跳过发布目录检查）。"
 } else {
-    Write-Host "[测试] UDP/IPv6/DbgHelp 与发布目录回归通过。"
+    Write-Host "[测试] UDP/IPv6/DbgHelp、发布目录与独立压缩包回归通过。"
 }

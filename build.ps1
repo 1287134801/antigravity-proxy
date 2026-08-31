@@ -20,6 +20,7 @@ param(
     [switch]$StaticRuntime,
     [switch]$DynamicRuntime,
     [switch]$Clean,
+    [switch]$RunTests,
     [switch]$SkipTests,
     [switch]$Help
 )
@@ -69,7 +70,8 @@ Antigravity-Proxy 编译脚本
     -StaticRuntime           使用静态运行库 (/MT) (默认启用)
     -DynamicRuntime          使用动态运行库 (/MD)
     -Clean                   清理后重新编译
-    -SkipTests               跳过测试步骤（当前脚本默认不执行自动测试，此参数用于 CI 显式声明）
+    -RunTests                构建并运行 CTest 回归测试
+    -SkipTests               显式跳过测试步骤（默认行为）
     -Verbose                 输出详细构建日志（PowerShell 通用参数）
     -Help                    显示帮助信息
 
@@ -79,6 +81,7 @@ Antigravity-Proxy 编译脚本
     .\build.ps1 -Arch x86            # Release x86 编译
     .\build.ps1 -DynamicRuntime      # 使用动态运行库编译
     .\build.ps1 -Clean -Config Debug # 清理后 Debug 编译
+    .\build.ps1 -RunTests            # 编译并运行 CTest
     .\build.ps1 -Verbose             # 显示详细编译输出
 "@
 }
@@ -90,6 +93,11 @@ Antigravity-Proxy 编译脚本
 if ($Help) {
     Show-Help
     exit 0
+}
+
+if ($RunTests -and $SkipTests) {
+    Write-Error "RunTests 与 SkipTests 参数互斥"
+    exit 1
 }
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -183,6 +191,9 @@ try {
     } else {
         $cmakeArgs += "-DSTATIC_RUNTIME=OFF"
     }
+    # 显式覆盖缓存值，确保 CI 的测试开关不受既有构建目录影响。
+    $buildTestsValue = if ($RunTests) { "ON" } else { "OFF" }
+    $cmakeArgs += "-DBUILD_TESTS=$buildTestsValue"
 
     $cmakeResult = & cmake @cmakeArgs 2>&1
     $cmakeFailed = ($LASTEXITCODE -ne 0)
@@ -248,13 +259,28 @@ try {
 }
 
 # ============================================================
-# 步骤 5.5: 测试提示（保持默认行为不变）
+# 步骤 5.5: 可选 CTest 回归
 # ============================================================
 
-if ($SkipTests) {
+if ($RunTests) {
+    Write-Step "运行 CTest 回归测试..."
+    Push-Location $BuildDir
+    try {
+        $ctestResult = & ctest -C $Config --output-on-failure 2>&1
+        $ctestFailed = ($LASTEXITCODE -ne 0)
+        $ctestResult | ForEach-Object { Write-Host $_ }
+        if ($ctestFailed) {
+            Write-Error "CTest 回归失败"
+            exit 1
+        }
+        Write-Success "CTest 回归通过"
+    } finally {
+        Pop-Location
+    }
+} elseif ($SkipTests) {
     Write-Step "已按参数跳过测试步骤 (-SkipTests)"
 } else {
-    Write-Step "当前脚本默认不执行自动测试（如需验证可在构建目录手动运行 ctest）"
+    Write-Step "默认跳过测试步骤（使用 -RunTests 可构建并运行 CTest）"
 }
 
 # ============================================================

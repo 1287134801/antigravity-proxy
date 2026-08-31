@@ -71,7 +71,8 @@ Microsoft 官方 dual-stack 说明：
   - `output/ide`：只含 `version.dll + config.json`。
   - `output/cli`：只含 `dbghelp.dll + antigravity_proxy.dll + config.json`。
   - output 根目录不再放 DLL。
-- `.github/workflows/release.yml`：压缩前断言两套目录必需文件齐全，并拒绝 IDE/根目录中的混装 DLL。
+- `scripts/package-release.ps1`：集中断言两套目录必需文件与禁止混装项，分别生成 IDE/CLI 压缩包。
+- `.github/workflows/build.yml`、`.github/workflows/release.yml`：每个架构只编译一次，CI artifact 与 Release 资产均按 IDE/CLI 拆分。
 
 ### 4.2 UDP auto
 
@@ -130,11 +131,11 @@ Microsoft 官方 dual-stack 说明：
 | Windows dual-stack | 通过 | `tests/test_socket_family.cpp`，x64/x86 均通过 |
 | DbgHelp 导出与动态转发 | 通过 | `tests/test_dbghelp_shim.cpp`，x64/x86 均通过 |
 | 进程分类与 IPv6 CIDR 旧回归 | 通过 | 既有 CTest，x64/x86 均通过 |
-| IDE/CLI 发布目录隔离 | 通过 | `scripts/test-compatibility.ps1` 对两架构产物执行文件存在性与禁止混装断言 |
-| Release x64/x86 编译 | 通过 | `build.ps1 -Config Release -Arch x64/x86 -SkipTests` |
+| IDE/CLI 发布目录与压缩包隔离 | 通过 | `scripts/test-compatibility.ps1` 对两架构目录及四种 ZIP 文件清单执行必需项与禁止混装断言 |
+| CI/Release x64/x86 编译与测试 | 通过 | `build.ps1 -Clean -Config Release -Arch x64/x86 -RunTests`，每个架构均通过 5/5 CTest |
 | 配置页渲染与默认值 | 通过 | 内置浏览器 1280×720 实测；诊断开关默认关闭、UDP 为 auto、无横向溢出或脚本错误 |
 
-执行记录：2026-08-31 分别运行 `scripts/test-compatibility.ps1 -Config Release -Arch x64` 与 `-Arch x86`，两次均以退出码 0 完成；全部测试源在 Release 下显式保留断言。DbgHelp 测试以 `agy.exe` 作为输出名，并确认首次调用系统导出时已加载 `antigravity_proxy.dll`。
+执行记录：2026-08-31 分别运行 `scripts/test-compatibility.ps1 -Config Release -Arch x64` 与 `-Arch x86`，随后按 CI/Release 入口运行两架构的 `build.ps1 -Clean -Config Release -RunTests`，全部以退出码 0 完成。全部测试源在 Release 下显式保留断言；DbgHelp 测试以 `agy.exe` 作为输出名，并确认首次调用系统导出时已加载 `antigravity_proxy.dll`。
 
 ## 7. 剩余人工验收
 
