@@ -84,4 +84,10 @@ inline bool IsLanguageServerProcessName(const std::string& processName) {
            lowerName.find("language_server_windows") != std::string::npos;
 }
 
+inline bool IsAntigravityHostProcessName(const std::string& processName) {
+    const std::string lowerName = ToLowerAsciiCopy(processName);
+    return lowerName == "antigravity.exe" ||
+           lowerName == "antigravity ide.exe";
+}
+
 } // namespace Hooks
