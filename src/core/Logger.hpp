@@ -289,6 +289,48 @@ namespace Core {
             }
         }
 
+        static void TryWriteAtProcessDetach(const std::string& message) {
+            // DllMain 的进程终止分支不能等待其他进程或本进程线程持有的日志锁。
+            HANDLE hMutex = GetCrossProcessLogMutex();
+            const DWORD waitRc = hMutex ? WaitForSingleObject(hMutex, 0) : WAIT_FAILED;
+            const bool locked = hMutex != NULL &&
+                (waitRc == WAIT_OBJECT_0 || waitRc == WAIT_ABANDONED);
+            if (!locked) {
+                OutputDebugStringA((message + "\n").c_str());
+                return;
+            }
+
+            const std::string line = message + "\r\n";
+            const std::string path = GetTodayLogName();
+            HANDLE file = CreateFileA(
+                path.c_str(),
+                FILE_APPEND_DATA,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                NULL,
+                OPEN_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                NULL
+            );
+            bool written = false;
+            if (file != INVALID_HANDLE_VALUE) {
+                const DWORD bytesToWrite = static_cast<DWORD>(line.size());
+                DWORD bytesWritten = 0;
+                written = WriteFile(
+                    file,
+                    line.data(),
+                    bytesToWrite,
+                    &bytesWritten,
+                    NULL
+                ) != FALSE && bytesWritten == bytesToWrite;
+                CloseHandle(file);
+            }
+            ReleaseMutex(hMutex);
+
+            if (!written) {
+                OutputDebugStringA((message + "\n").c_str());
+            }
+        }
+
     public:
         // 暴露日志目录给加载提示使用，便于用户一键打开排障目录。
         static std::string GetLogDirectoryPath() {
@@ -333,6 +375,12 @@ namespace Core {
         static void Info(const std::string& message) {
             if (!IsEnabled(LogLevel::Info)) return;
             WriteToFile("[" + GetTimestamp() + "] " + GetPidTidPrefix() + " [信息] " + message);
+        }
+
+        // 仅供 DLL_PROCESS_DETACH 的进程终止分支使用：尽力落盘，但绝不等待日志锁。
+        static void TryInfoAtProcessDetach(const std::string& message) {
+            if (!IsEnabled(LogLevel::Info)) return;
+            TryWriteAtProcessDetach("[" + GetTimestamp() + "] " + GetPidTidPrefix() + " [信息] " + message);
         }
 
         static void Warn(const std::string& message) {

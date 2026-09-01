@@ -364,6 +364,48 @@ static std::string GetCreateProcessTargetBaseNameW(LPCWSTR applicationName, LPCW
                                            cmd.empty() ? nullptr : cmd.c_str());
 }
 
+static std::string FormatHexDword(DWORD value) {
+    char buffer[2 + sizeof(DWORD) * 2] = {'0', 'x'};
+    const auto converted = std::to_chars(buffer + 2, buffer + sizeof(buffer), value, 16);
+    return converted.ec == std::errc() ? std::string(buffer, converted.ptr) : std::string("0x?");
+}
+
+// 仅记录可定位的进程元数据，避免把完整命令行中的 URL 或令牌写入日志。
+static std::string BuildCreateProcessDiagnosticContext(
+    const char* api,
+    DWORD creationFlags,
+    DWORD effectiveCreationFlags,
+    const PROCESS_INFORMATION& processInformation,
+    const std::string& targetBaseName
+) {
+    return "api=" + std::string(api) +
+           ", creator_pid=" + std::to_string(GetCurrentProcessId()) +
+           ", child_pid=" + std::to_string(processInformation.dwProcessId) +
+           ", creation_flags=" + FormatHexDword(creationFlags) +
+           ", effective_creation_flags=" + FormatHexDword(effectiveCreationFlags) +
+           ", target_basename=" + targetBaseName;
+}
+
+// 保持原有恢复时机；记录 ResumeThread 结果用于诊断，不改变既有控制流。
+static void ResumeCreatedProcessThread(
+    const PROCESS_INFORMATION& processInformation,
+    const std::string& diagnosticContext
+) {
+    const DWORD resumeResult = ResumeThread(processInformation.hThread);
+    if (resumeResult == static_cast<DWORD>(-1)) {
+        const DWORD error = GetLastError();
+        Core::Logger::Error("[失败] ResumeThread 恢复子进程主线程失败: " + diagnosticContext +
+                            ", error=" + std::to_string(error));
+    } else if (resumeResult > 1) {
+        Core::Logger::Warn("[警告] ResumeThread 返回后子进程主线程仍有挂起计数: " + diagnosticContext +
+                           ", previous_suspend_count=" + std::to_string(resumeResult) +
+                           ", remaining_suspend_count=" + std::to_string(resumeResult - 1));
+    } else if (Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
+        Core::Logger::Debug("ResumeThread 已调用: " + diagnosticContext +
+                            ", previous_suspend_count=" + std::to_string(resumeResult));
+    }
+}
+
 struct AgentExitIpEvidence {
     bool success = false;
     bool datacenterLike = false;
@@ -3570,6 +3612,8 @@ BOOL WINAPI DetourCreateProcessW(
     if (result && needInject && lpProcessInformation) {
         // 从 CreateProcess 参数提取真实 exe 名；兼容 `Antigravity IDE.exe` 这类带空格文件名。
         std::string appName = GetCreateProcessTargetBaseNameW(lpApplicationName, lpCommandLine);
+        const std::string diagnosticContext = BuildCreateProcessDiagnosticContext(
+            "CreateProcessW", dwCreationFlags, modifiedFlags, *lpProcessInformation, appName);
         
         const bool excluded = config.IsChildInjectionExcluded(appName);
         const bool compatInject = (!excluded) && ShouldAutoInjectLanguageServerNodeChild(config, appName);
@@ -3591,22 +3635,22 @@ BOOL WINAPI DetourCreateProcessW(
             }
             if (shouldLog) {
                 if (excluded) {
-                    Core::Logger::Info("[跳过] 子进程在 child_injection_exclude 列表(仅首次记录): " + appName +
-                                      " (PID: " + std::to_string(lpProcessInformation->dwProcessId) + ")");
+                    Core::Logger::Info("[跳过] 子进程在 child_injection_exclude 列表(仅首次记录): " +
+                                       diagnosticContext);
                 } else {
-                    Core::Logger::Info("[跳过] child_injection_mode=filtered 非目标进程(仅首次记录): " + appName +
-                                      " (PID: " + std::to_string(lpProcessInformation->dwProcessId) + ")");
+                    Core::Logger::Info("[跳过] child_injection_mode=filtered 非目标进程(仅首次记录): " +
+                                       diagnosticContext);
                 }
             }
             // 恢复进程（不注入）
             if (!(dwCreationFlags & CREATE_SUSPENDED)) {
-                ResumeThread(lpProcessInformation->hThread);
+                ResumeCreatedProcessThread(*lpProcessInformation, diagnosticContext);
             }
         } else {
             if (compatInject) {
                 LogLanguageServerNodeCompatInjectOnce(appName);
             }
-            Core::Logger::Info("拦截到进程创建，准备注入 DLL...");
+            Core::Logger::Info("拦截到进程创建，准备注入 DLL: " + diagnosticContext);
             
             // 注入 DLL 到子进程
             std::wstring dllPath = Injection::ProcessInjector::GetCurrentDllPath();
@@ -3614,18 +3658,18 @@ BOOL WINAPI DetourCreateProcessW(
                 std::string injectFailureReason;
                 const bool injected = Injection::ProcessInjector::InjectDll(lpProcessInformation->hProcess, dllPath, &injectFailureReason);
                 if (injected) {
-                    Core::Logger::Info("[成功] 已注入目标进程: " + appName + " (PID: " + std::to_string(lpProcessInformation->dwProcessId) + ") - 父子关系建立");
+                    Core::Logger::Info("[成功] 已注入新建进程: " + diagnosticContext);
                 } else {
-                    Core::Logger::Error("[失败] 注入目标进程失败: " + appName + " (PID: " + std::to_string(lpProcessInformation->dwProcessId) + ")" +
-                                       (injectFailureReason.empty() ? std::string("") : (", 原因: " + injectFailureReason)));
+                    Core::Logger::Error("[失败] 注入目标进程失败: " + diagnosticContext +
+                                        (injectFailureReason.empty() ? std::string("") : (", 原因: " + injectFailureReason)));
                 }
             } else {
-                Core::Logger::Error("[失败] 获取当前 DLL 路径失败，跳过注入: " + appName + " (PID: " + std::to_string(lpProcessInformation->dwProcessId) + ")");
+                Core::Logger::Error("[失败] 获取当前 DLL 路径失败，跳过注入: " + diagnosticContext);
             }
             
             // 如果原始调用没有要求挂起，则恢复进程
             if (!(dwCreationFlags & CREATE_SUSPENDED)) {
-                ResumeThread(lpProcessInformation->hThread);
+                ResumeCreatedProcessThread(*lpProcessInformation, diagnosticContext);
             }
         }
     }
@@ -3671,6 +3715,8 @@ BOOL WINAPI DetourCreateProcessA(
     if (result && needInject && lpProcessInformation) {
         // 从 CreateProcess 参数提取真实 exe 名；兼容 `Antigravity IDE.exe` 这类带空格文件名。
         std::string appName = GetCreateProcessTargetBaseNameA(lpApplicationName, lpCommandLine);
+        const std::string diagnosticContext = BuildCreateProcessDiagnosticContext(
+            "CreateProcessA", dwCreationFlags, modifiedFlags, *lpProcessInformation, appName);
         
         const bool excluded = config.IsChildInjectionExcluded(appName);
         const bool compatInject = (!excluded) && ShouldAutoInjectLanguageServerNodeChild(config, appName);
@@ -3692,22 +3738,22 @@ BOOL WINAPI DetourCreateProcessA(
             }
             if (shouldLog) {
                 if (excluded) {
-                    Core::Logger::Info("[跳过] 子进程在 child_injection_exclude 列表(仅首次记录): " + appName +
-                                      " (PID: " + std::to_string(lpProcessInformation->dwProcessId) + ")");
+                    Core::Logger::Info("[跳过] 子进程在 child_injection_exclude 列表(仅首次记录): " +
+                                       diagnosticContext);
                 } else {
-                    Core::Logger::Info("[跳过] child_injection_mode=filtered 非目标进程(仅首次记录): " + appName +
-                                      " (PID: " + std::to_string(lpProcessInformation->dwProcessId) + ")");
+                    Core::Logger::Info("[跳过] child_injection_mode=filtered 非目标进程(仅首次记录): " +
+                                       diagnosticContext);
                 }
             }
             // 恢复进程（不注入）
             if (!(dwCreationFlags & CREATE_SUSPENDED)) {
-                ResumeThread(lpProcessInformation->hThread);
+                ResumeCreatedProcessThread(*lpProcessInformation, diagnosticContext);
             }
         } else {
             if (compatInject) {
                 LogLanguageServerNodeCompatInjectOnce(appName);
             }
-            Core::Logger::Info("拦截到进程创建(CreateProcessA)，准备注入 DLL...");
+            Core::Logger::Info("拦截到进程创建，准备注入 DLL: " + diagnosticContext);
             
             // 注入 DLL 到子进程
             std::wstring dllPath = Injection::ProcessInjector::GetCurrentDllPath();
@@ -3715,18 +3761,18 @@ BOOL WINAPI DetourCreateProcessA(
                 std::string injectFailureReason;
                 const bool injected = Injection::ProcessInjector::InjectDll(lpProcessInformation->hProcess, dllPath, &injectFailureReason);
                 if (injected) {
-                    Core::Logger::Info("[成功] 已注入目标进程: " + appName + " (PID: " + std::to_string(lpProcessInformation->dwProcessId) + ") - 父子关系建立");
+                    Core::Logger::Info("[成功] 已注入新建进程: " + diagnosticContext);
                 } else {
-                    Core::Logger::Error("[失败] 注入目标进程失败: " + appName + " (PID: " + std::to_string(lpProcessInformation->dwProcessId) + ")" +
-                                       (injectFailureReason.empty() ? std::string("") : (", 原因: " + injectFailureReason)));
+                    Core::Logger::Error("[失败] 注入目标进程失败: " + diagnosticContext +
+                                        (injectFailureReason.empty() ? std::string("") : (", 原因: " + injectFailureReason)));
                 }
             } else {
-                Core::Logger::Error("[失败] 获取当前 DLL 路径失败，跳过注入: " + appName + " (PID: " + std::to_string(lpProcessInformation->dwProcessId) + ")");
+                Core::Logger::Error("[失败] 获取当前 DLL 路径失败，跳过注入: " + diagnosticContext);
             }
             
             // 如果原始调用没有要求挂起，则恢复进程
             if (!(dwCreationFlags & CREATE_SUSPENDED)) {
-                ResumeThread(lpProcessInformation->hThread);
+                ResumeCreatedProcessThread(*lpProcessInformation, diagnosticContext);
             }
         }
     }

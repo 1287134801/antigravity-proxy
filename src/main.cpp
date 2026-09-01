@@ -25,6 +25,56 @@ namespace VersionProxy {
 }
 
 namespace {
+    static bool IsCommandLineWhitespace(wchar_t value) {
+        return value == L' ' || value == L'\t' || value == L'\r' || value == L'\n';
+    }
+
+    static bool IsOpenUrlArgument(const wchar_t* begin, const wchar_t* end) {
+        constexpr wchar_t kOpenUrlSwitch[] = L"--open-url";
+        const wchar_t* cursor = begin;
+        for (const wchar_t* expected = kOpenUrlSwitch; *expected != L'\0'; ++expected) {
+            while (cursor < end && *cursor == L'"') ++cursor;
+            if (cursor == end || *cursor != *expected) return false;
+            ++cursor;
+        }
+
+        while (cursor < end && *cursor == L'"') ++cursor;
+        return cursor == end || *cursor == L'=';
+    }
+
+    static bool IsOpenUrlProtocolLaunch() {
+        // 只按参数边界检查启动标记，不复制、保存或记录可能包含 URL、查询参数及令牌的内容。
+        const wchar_t* cursor = GetCommandLineW();
+        if (cursor == nullptr) return false;
+
+        while (*cursor != L'\0') {
+            while (IsCommandLineWhitespace(*cursor)) ++cursor;
+            if (*cursor == L'\0') break;
+
+            const wchar_t* argumentBegin = cursor;
+            bool inQuotes = false;
+            unsigned int precedingBackslashes = 0;
+            while (*cursor != L'\0') {
+                const wchar_t value = *cursor;
+                if (value == L'\\') {
+                    ++precedingBackslashes;
+                    ++cursor;
+                    continue;
+                }
+                if (value == L'"' && (precedingBackslashes % 2) == 0) {
+                    inQuotes = !inQuotes;
+                } else if (!inQuotes && IsCommandLineWhitespace(value)) {
+                    break;
+                }
+                precedingBackslashes = 0;
+                ++cursor;
+            }
+
+            if (IsOpenUrlArgument(argumentBegin, cursor)) return true;
+        }
+        return false;
+    }
+
     static std::string GetCurrentProcessBaseName() {
         char processPath[MAX_PATH] = {0};
         const DWORD len = GetModuleFileNameA(NULL, processPath, MAX_PATH);
@@ -194,6 +244,9 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
         VersionProxy::Initialize();  // 空操作，保持接口兼容
         
         Core::Logger::Info("Antigravity-Proxy DLL 已加载 (模拟 version.dll)");
+        Core::Logger::Info(IsOpenUrlProtocolLaunch()
+            ? "启动类型：协议启动"
+            : "启动类型：普通启动");
         
         // 加载配置
         const bool loaded = Core::Config::Instance().Load("config.json");
@@ -221,9 +274,16 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     }
         
     case DLL_PROCESS_DETACH: {
+        if (lpvReserved != nullptr) {
+            // 进程终止时其他模块和线程状态不可控；仅保留一次日志作为原因证据，不执行复杂清理。
+            Core::Logger::TryInfoAtProcessDetach("进程终止，DLL 随当前进程分离：已跳过 Hooks 与版本代理清理");
+            break;
+        }
+
+        // lpvReserved 为空表示动态卸载，或 DLL 加载失败后的回滚；此时保留必要清理。
         Hooks::Uninstall();
         VersionProxy::Uninitialize();
-        Core::Logger::Info("Antigravity-Proxy DLL 已卸载");
+        Core::Logger::Info("DLL 被显式释放或加载失败回滚：已完成 Hooks 与版本代理清理");
         break;
     }
     }
