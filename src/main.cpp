@@ -258,11 +258,13 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             break;
         }
 
-        // OAuth 与业务请求可能由 Electron 宿主进程直接发起；默认让所有进程进入完整
-        // 网络 Hook，确保宿主侧连接也能进入代理，同时继续保留 CreateProcess 注入链。
+        // Electron 宿主及其同名子进程只保留进程创建 Hook，避免完整 Winsock/IOCP Hook
+        // 干扰宿主与 Language Server 之间的本地自签名 TLS；Language Server/Node 仍使用全量网络 Hook。
         const std::string processName = GetCurrentProcessBaseName();
-        const bool enableNetworkHooks = true;
-        Core::Logger::Info("当前进程 " + processName + " 使用全量模式：安装网络与进程创建 Hook");
+        const bool enableNetworkHooks = !Hooks::IsAntigravityHostProcessName(processName);
+        Core::Logger::Info(enableNetworkHooks
+            ? "当前进程 " + processName + " 使用全量模式：安装网络与进程创建 Hook"
+            : "当前进程 " + processName + " 使用注入器模式：仅安装进程创建 Hook，跳过网络 Hook");
         Hooks::Install(enableNetworkHooks);
         MaybeShowLoadNotifyAsync(true);
         // 更新检查默认关闭；启用后也只在后台异步提示，不阻塞 Hook 安装主流程。
