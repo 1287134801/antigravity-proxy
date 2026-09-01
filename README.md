@@ -17,7 +17,8 @@
 </p>
 
 <p align="center">
-  <a href="README_EN.md">🇬🇧 English Version</a>
+  <a href="README_EN.md">🇬🇧 English Version</a> |
+  <a href="README_RU.md">🇷🇺 Русская версия</a>
 </p>
 
 ---
