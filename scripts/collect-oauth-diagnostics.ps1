@@ -35,10 +35,10 @@ function Protect-SensitiveText {
     })
 
     $patterns = @(
-        @{ Pattern = '(?i)([?&#](?:code|state|nonce|token|access_token|refresh_token|id_token|code_verifier|code_challenge)=)[^&\s<>"'']+'; Replacement = '$1[REDACTED]' },
-        @{ Pattern = '(?i)(\b(?:access_token|refresh_token|id_token|authorization_code|code_verifier|code_challenge|client_secret)\b["'']?\s*[:=]\s*["'']?)[^\s,;"''}\]]+'; Replacement = '$1[REDACTED]' },
+        @{ Pattern = '(?i)([?&#](?:code|state|nonce|token|access_token|refresh_token|id_token|code_verifier|code_challenge|csrf_token|extension_server_csrf_token)=)[^&\s<>"'']+'; Replacement = '$1[REDACTED]' },
+        @{ Pattern = '(?i)(\b(?:access_token|refresh_token|id_token|authorization_code|code_verifier|code_challenge|client_secret|csrf_token|extension_server_csrf_token)\b["'']?\s*[:=]\s*["'']?)[^\s,;"''}\]]+'; Replacement = '$1[REDACTED]' },
         @{ Pattern = '(?i)(\b(?:code|state|nonce|token)\b["'']?\s*[:=]\s*["'']?)[^\s,;"''}\]]+'; Replacement = '$1[REDACTED]' },
-        @{ Pattern = '(?i)(--(?:access-token|refresh-token|id-token|token|code|state|nonce)\s+)(?:"[^"]+"|''[^'']+''|\S+)'; Replacement = '$1[REDACTED]' },
+        @{ Pattern = '(?i)(--(?:access[-_]token|refresh[-_]token|id[-_]token|csrf[-_]token|extension[-_]server[-_]csrf[-_]token|token|code|state|nonce)\s+)(?:"[^"]+"|''[^'']+''|\S+)'; Replacement = '$1[REDACTED]' },
         @{ Pattern = '(?i)((?:%3F|%26)(?:code|state|nonce|token|access_token|refresh_token|id_token|code_verifier)%3D)[A-Za-z0-9._~%+/-]+'; Replacement = '$1[REDACTED]' },
         @{ Pattern = '(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]+'; Replacement = '$1[REDACTED]' },
         @{ Pattern = '\b[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\b'; Replacement = '[REDACTED_JWT]' }
@@ -165,7 +165,16 @@ if ([string]::IsNullOrWhiteSpace($InstallDir)) {
     $InstallDir = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Container } | Select-Object -First 1
     if (-not $InstallDir -and $candidates.Count -gt 0) { $InstallDir = $candidates[0] }
 }
-if ([string]::IsNullOrWhiteSpace($LogRoot) -and $env:APPDATA) { $LogRoot = Join-Path $env:APPDATA 'Antigravity\logs' }
+if ([string]::IsNullOrWhiteSpace($LogRoot) -and $env:APPDATA) {
+    $logRootCandidates = @(
+        (Join-Path $env:APPDATA 'Antigravity IDE\logs'),
+        (Join-Path $env:APPDATA 'Antigravity\logs')
+    )
+    $LogRoot = $logRootCandidates | Where-Object {
+        Test-Path -LiteralPath $_ -PathType Container
+    } | Select-Object -First 1
+    if (-not $LogRoot) { $LogRoot = $logRootCandidates[0] }
+}
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
     $OutputDir = Join-Path ([IO.Path]::GetTempPath()) ('antigravity-oauth-diagnostics-' + $CollectedAt.ToString('yyyyMMdd-HHmmss'))
 }

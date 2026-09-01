@@ -37,7 +37,7 @@ $oldEnvironment = @{
 try {
     $InstallDir = Join-Path $FixtureRoot 'install'
     $ProxyLogDir = Join-Path $InstallDir 'logs'
-    $IdeLogRoot = Join-Path $FixtureRoot 'appdata\Antigravity\logs'
+    $IdeLogRoot = Join-Path $FixtureRoot 'appdata\Antigravity IDE\logs'
     $IdeSessionDir = Join-Path $IdeLogRoot 'session-1'
     $IsolatedTemp = Join-Path $FixtureRoot 'temp'
     $OutputDir = Join-Path $FixtureRoot 'evidence'
@@ -64,6 +64,7 @@ try {
         'Authorization: Bearer BEARER_SECRET_789',
         'jwt HEADERHEADERHEADER.PAYLOADPAYLOADPAYLOAD.SIGNATURESIGNATURE',
         'nonce=short7',
+        '--csrf_token CSRF_SECRET_123 --extension_server_csrf_token EXTENSION_CSRF_SECRET_456',
         '2026-09-01 17:07:00 [信息] AFTER_WINDOW_MARKER code=AFTER_SECRET'
     )
 
@@ -89,7 +90,6 @@ try {
     }
     $collectorOutput = & $WindowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $Collector `
         -InstallDir $InstallDir `
-        -LogRoot $IdeLogRoot `
         -OutputDir $OutputDir `
         -WindowStart '2026-09-01 17:04:30' `
         -WindowEnd '2026-09-01 17:05:30' `
@@ -105,6 +105,7 @@ try {
 
     $Evidence = Get-Content -LiteralPath $SummaryJson -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-True ($Evidence.Context.LiveSystemStateSkipped -eq $true) '合成测试没有进入隔离系统状态模式。'
+    Assert-True ($Evidence.Context.LogRoot -eq $IdeLogRoot) '默认日志根没有优先选择 Antigravity IDE\logs。'
     Assert-True (@($Evidence.Processes).Count -eq 0) '隔离模式不应采集当前进程。'
     Assert-True (@($Evidence.ProtocolRegistrations).Count -eq 0) '隔离模式不应读取协议注册表。'
 
@@ -130,13 +131,16 @@ try {
     Assert-Contains $AllOutput 'antigravity-ide://oauth-success?[REDACTED]#[REDACTED]' '协议 URL 没有按预期保留路径并遮蔽参数。'
     Assert-Contains $AllOutput '[REDACTED_JWT]' 'JWT 没有被遮蔽。'
     Assert-Contains $AllOutput 'nonce=[REDACTED]' '短 nonce 没有被遮蔽。'
+    Assert-Contains $AllOutput '--csrf_token [REDACTED]' '下划线 CSRF 参数没有被遮蔽。'
+    Assert-Contains $AllOutput '--extension_server_csrf_token [REDACTED]' '扩展服务 CSRF 参数没有被遮蔽。'
     Assert-Contains $AllOutput 'https://accounts.example.test/callback?[REDACTED]#[REDACTED]' 'URL userinfo 没有被移除。'
     foreach ($unexpected in @(
         'BEFORE_WINDOW_MARKER', 'AFTER_WINDOW_MARKER', 'OLD_FALLBACK_MARKER',
         'CODE_SECRET_123', 'STATE_SECRET_456', 'FRAGMENT_SECRET', 'BEARER_SECRET_789',
         'HEADERHEADERHEADER.PAYLOADPAYLOADPAYLOAD.SIGNATURESIGNATURE', 'short7',
         'FALLBACK_SECRET_123', 'USERINFO_SECRET', 'PASSWORD_SECRET',
-        'HTTPS_SECRET', 'HTTPS_FRAGMENT', 'OLD_SECRET'
+        'HTTPS_SECRET', 'HTTPS_FRAGMENT', 'CSRF_SECRET_123',
+        'EXTENSION_CSRF_SECRET_456', 'OLD_SECRET'
     )) {
         Assert-NotContains $AllOutput $unexpected "输出仍包含不应出现的内容：$unexpected"
     }
@@ -153,7 +157,7 @@ try {
     $ErrorActionPreference = 'Continue'
     try {
         $secondOutput = & $WindowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $Collector `
-            -InstallDir $InstallDir -LogRoot $IdeLogRoot -OutputDir $OutputDir `
+            -InstallDir $InstallDir -OutputDir $OutputDir `
             -WindowStart '2026-09-01 17:04:30' -WindowEnd '2026-09-01 17:05:30' `
             -SkipLiveSystemState 2>&1
         $secondExitCode = $LASTEXITCODE
