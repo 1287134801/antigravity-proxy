@@ -258,14 +258,11 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             break;
         }
 
-        // Antigravity 的 Electron 网络服务子进程与主程序同名，也会通过 DLL 搜索顺序
-        // 自动加载本 DLL。它们只需保留 CreateProcess Hook 以继续注入 language server；
-        // 对这些进程安装 Winsock/IOCP Hook 会破坏 UI 与 language server 的本机自签名 TLS。
+        // OAuth 与业务请求可能由 Electron 宿主进程直接发起；默认让所有进程进入完整
+        // 网络 Hook，确保宿主侧连接也能进入代理，同时继续保留 CreateProcess 注入链。
         const std::string processName = GetCurrentProcessBaseName();
-        const bool enableNetworkHooks = !Hooks::IsAntigravityHostProcessName(processName);
-        if (!enableNetworkHooks) {
-            Core::Logger::Info("当前进程 " + processName + " 使用注入器模式：仅安装进程创建 Hook，跳过网络 Hook");
-        }
+        const bool enableNetworkHooks = true;
+        Core::Logger::Info("当前进程 " + processName + " 使用全量模式：安装网络与进程创建 Hook");
         Hooks::Install(enableNetworkHooks);
         MaybeShowLoadNotifyAsync(true);
         // 更新检查默认关闭；启用后也只在后台异步提示，不阻塞 Hook 安装主流程。

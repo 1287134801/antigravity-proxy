@@ -38,8 +38,7 @@ int main() {
     assert(IsLanguageServerProcessName("language_server_windows_x64.exe"));
     assert(!IsLanguageServerProcessName("Antigravity IDE.exe"));
 
-    // Electron 主程序及其同名子进程只负责继续注入，不安装网络 Hook，
-    // 避免破坏 UI 与 language server 之间的本机自签名 HTTPS/gRPC。
+    // 保留宿主进程名分类工具的稳定行为；运行时默认策略在 main.cpp 中统一启用全量 Hook。
     assert(IsAntigravityHostProcessName("Antigravity.exe"));
     assert(IsAntigravityHostProcessName("ANTIGRAVITY IDE.EXE"));
     assert(!IsAntigravityHostProcessName("language_server.exe"));

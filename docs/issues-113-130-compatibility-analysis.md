@@ -9,7 +9,7 @@
 本轮 16 个 open issue 不是同一个根因，可归并为四条主线：
 
 1. **IDE 崩溃/无响应**：CLI 专用 `dbghelp.dll` 与 IDE 的 `version.dll` 被打进同一部署目录，用户混装后遮蔽系统 DbgHelp；旧 shim 还在 `DllMain` 内调用 `LoadLibraryW`。
-2. **Loading/TLS/语言服务器异常**：v2.2 对 Electron host 安装了完整网络 Hook；PR #128 已在 main 把 host 限制为 CreateProcess Hook，但公开 release 尚未包含。
+2. **Loading/TLS/语言服务器异常**：v2.2 对 Electron host 安装了完整网络 Hook；PR #128 曾把 host 限制为 CreateProcess Hook。2026-09-01 为恢复 OAuth 与宿主业务流量接管，当前工作区默认重新启用全量网络 Hook，需在目标 IDE 版本上复测本地 TLS/UI。
 3. **图片对话、登录与 UDP/443 失败**：默认 `udp_mode=block` 直接对 UDP/443 返回 `WSAEACCES=10013`，而新版本并不总会回退 TCP。
 4. **Eligibility/location 拒绝**：附件日志已证明 SOCKS5 隧道成功，失败发生在上游资格或出口 IP 判定；项目缺少默认配置可见的诊断入口。
 
@@ -94,6 +94,12 @@ Microsoft 官方 dual-stack 说明：
 - `resources/config-web/index.html` 新增 `diagnostics.agent_ip_probe` 开关。
 - 配置页支持 `udp_mode=auto`，并对 HTTP + auto/proxy 显示兼容提示。
 - `build.ps1`、`README.md`、`docs/config-web*.md` 与后端默认值保持一致。
+
+### 4.5 宿主 Hook 默认策略（2026-09-01）
+
+- `src/main.cpp::DllMain` 当前将 `enableNetworkHooks` 固定为 `true`，宿主和子进程统一安装网络、IOCP、流量监控与进程创建 Hook。
+- 该调整针对跨机日志中宿主进程外联范围缩小的回归；部署验收需同时检查宿主 PID 的 `使用全量模式`、目标域名重定向和 OAuth `signedIn`。
+- PR #128 记录的宿主本地自签名 TLS 风险仍是已知观察项；若出现 UI 或 language server 异常，应保留现场日志后再单独收敛范围。
 
 ## 5. 配置迁移
 

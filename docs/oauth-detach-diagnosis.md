@@ -10,6 +10,18 @@
 
 当前证据已经形成“浏览器成功 -> Windows 启动协议进程 -> IDE 主实例没有记录 callback -> 登录态仍为 `signedOut`”的失败链路。`child_injection=false` 控制实验复现了同一失败，因此本次代理子进程注入路径已从根因中排除；IDE 登录问题本身仍未解决。
 
+## 2026-09-01 宿主网络 Hook 范围回归
+
+针对另一台测试机提供的旧/新 DLL 日志，结合本机短时 A/B 得到以下对照：
+
+- 旧组合的宿主与子进程均记录 `所有 API Hook 安装成功 (Phase 1-3)`，宿主 PID `14768` 实际重定向 `daily-cloudcode-pa.googleapis.com:443` 并建立 SOCKS5 隧道。
+- 新组合中 10 个 `Antigravity IDE.exe` 进程记录 `仅安装进程创建 Hook，跳过网络 Hook`，只有 PID `13828`、`24676` 安装完整网络 Hook；仍有少量隧道建立，说明代理端口和 SOCKS5 服务有响应，但宿主外联范围缩小。
+- 本机以安装目录旧组合和 `output/ide` 新组合复现了同一分类差异；新组合出现 8 个宿主跳过、语言服务/Node 完整 Hook。临时用户目录未进入真实 OAuth，因此本机尚未形成 callback/token exchange 的功能结论。
+- 源码对应 `src/main.cpp:261-269`、`src/hooks/ProcessName.hpp:87-90`、`src/hooks/Hooks.cpp:4528`。本次修复已将 `src/main.cpp:265` 的默认值恢复为全量网络 Hook，宿主启动日志应出现 `使用全量模式`。
+- 全量组合与旧组合的短启动对照都出现一次 Chromium `Network service crashed, restarting service`；该单行 stderr 不是两组策略的区分证据，OAuth 回调、token exchange 和 `signedIn` 才是功能验收点。
+
+部署时需将同一次构建、同一架构生成的 `version.dll` 与 `config.json` 成对复制到实际启动目录。`output/ide` 生成物与安装目录中的历史文件应保持成对，避免交叉拼接；替换前后应记录 SHA-256，复测结束后再恢复备份。
+
 ## 已有证据
 
 用户提供的浏览器截图显示 `You have successfully authenticated.`，并提示将跳回产品；IDE 截图仍停留在 `Continue with Google` 欢迎页。它们能证明浏览器侧授权页成功，不能单独证明自定义协议已由预期 IDE 进程处理，也不能证明 IDE 已接收并持久化登录态。
