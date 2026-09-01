@@ -4,6 +4,7 @@
 #endif
 
 #include <windows.h>
+#include <cwchar>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -80,6 +81,12 @@ namespace {
         const DWORD len = GetModuleFileNameA(NULL, processPath, MAX_PATH);
         if (len == 0 || len >= MAX_PATH) return "Unknown";
         return Hooks::ExtractBaseNameFromPathLike(processPath);
+    }
+
+    static bool IsChromiumNetworkServiceProcess() {
+        const wchar_t* commandLine = GetCommandLineW();
+        return commandLine != nullptr &&
+               std::wcsstr(commandLine, L"--utility-sub-type=network.mojom.NetworkService") != nullptr;
     }
 
     struct LoadNotifyPayload {
@@ -258,11 +265,14 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             break;
         }
 
-        // Electron 主进程、NetworkService 与 NodeService 都可能直接发起外网请求；
-        // 仅按可执行文件名禁用网络 Hook 会让宿主流量绕过代理，因此统一启用全量模式。
+        // 诊断构建：只旁路 Chromium NetworkService，用于区分宿主进程角色对本地 TLS 的影响。
         const std::string processName = GetCurrentProcessBaseName();
-        const bool enableNetworkHooks = true;
-        Core::Logger::Info("当前进程 " + processName + " 使用全量模式：安装网络与进程创建 Hook");
+        const bool bypassNetworkService =
+            Hooks::IsAntigravityHostProcessName(processName) && IsChromiumNetworkServiceProcess();
+        const bool enableNetworkHooks = !bypassNetworkService;
+        Core::Logger::Info(enableNetworkHooks
+            ? "当前进程 " + processName + " 使用全量模式：安装网络与进程创建 Hook"
+            : "当前进程 " + processName + " 使用 NetworkService 旁路模式：仅安装进程创建 Hook");
         Hooks::Install(enableNetworkHooks);
         MaybeShowLoadNotifyAsync(true);
         // 更新检查默认关闭；启用后也只在后台异步提示，不阻塞 Hook 安装主流程。
