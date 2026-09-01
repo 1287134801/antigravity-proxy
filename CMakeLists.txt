@@ -207,6 +207,15 @@ if(BUILD_TESTS)
   target_link_libraries(socket_family_tests PRIVATE ws2_32)
   add_test(NAME socket_family_tests COMMAND socket_family_tests)
 
+  add_executable(local_target_policy_tests
+    "tests/test_local_target_policy.cpp"
+  )
+  target_include_directories(local_target_policy_tests PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+  )
+  target_link_libraries(local_target_policy_tests PRIVATE ws2_32)
+  add_test(NAME local_target_policy_tests COMMAND local_target_policy_tests)
+
   add_executable(dbghelp_shim_tests
     "tests/test_dbghelp_shim.cpp"
   )

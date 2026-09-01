@@ -14,7 +14,9 @@
 #include <fstream>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <mutex>
+#include <shared_mutex>
 #include <atomic>
 #include <memory>
 #include <utility>
@@ -27,6 +29,7 @@
 #include "../network/HttpConnect.hpp"
 #include "../network/SocketIo.hpp"
 #include "../network/SocketFamily.hpp"
+#include "../network/LocalTargetPolicy.hpp"
 #include "../network/TrafficMonitor.hpp"
 #include "../injection/ProcessInjector.hpp"
 #include "ProcessName.hpp"
@@ -120,6 +123,35 @@ struct SocketTargetInfo {
 };
 static std::unordered_map<SOCKET, SocketTargetInfo> g_socketTargets;
 static std::mutex g_socketTargetsMtx;
+
+// 回环连接一旦命中早期旁路，后续收发与关闭阶段也必须保持原始 WinSock 语义。
+static std::unordered_set<SOCKET> g_localBypassSockets;
+static std::shared_mutex g_localBypassSocketsMtx;
+
+static void SetLocalBypassSocket(SOCKET s, bool enabled) {
+    if (s == INVALID_SOCKET) return;
+    std::unique_lock<std::shared_mutex> lock(g_localBypassSocketsMtx);
+    if (enabled) {
+        g_localBypassSockets.insert(s);
+    } else {
+        g_localBypassSockets.erase(s);
+    }
+}
+
+static bool IsLocalBypassSocket(SOCKET s) {
+    if (s == INVALID_SOCKET) return false;
+    std::shared_lock<std::shared_mutex> lock(g_localBypassSocketsMtx);
+    return g_localBypassSockets.find(s) != g_localBypassSockets.end();
+}
+
+static bool IsPendingConnectError(int error) {
+    return error == WSAEWOULDBLOCK || error == WSAEINPROGRESS ||
+           error == WSAEALREADY || error == WSA_IO_PENDING;
+}
+
+static void UpdateLocalBypassSocketAfterConnect(SOCKET s, bool succeeded, int error) {
+    SetLocalBypassSocket(s, succeeded || IsPendingConnectError(error));
+}
 
 static void RememberSocketTarget(SOCKET s, const std::string& host, uint16_t port) {
     if (s == INVALID_SOCKET || host.empty() || port == 0) return;
@@ -929,8 +961,7 @@ static bool ResolveOriginalTarget(const sockaddr* name, std::string* host, uint1
 }
 
 static bool IsLoopbackHost(const std::string& host) {
-    if (host == "127.0.0.1" || host == "localhost" || host == "::1") return true;
-    return host.size() >= 4 && host.substr(0, 4) == "127.";
+    return Network::IsLoopbackHost(host);
 }
 
 // 判断是否为 IP 字面量（IPv4/IPv6），避免对纯 IP 走 FakeIP 影响原始语义
@@ -958,6 +989,12 @@ static std::string SockaddrToString(const sockaddr* addr) {
         return std::string(buf) + ":" + std::to_string(ntohs(addr6->sin6_port));
     }
     return "";
+}
+
+static void LogLocalTargetBypass(const char* api, SOCKET s, const std::string& target) {
+    Core::Logger::Info("本地目标全透明旁路: api=" + std::string(api) +
+                       ", sock=" + std::to_string((unsigned long long)s) +
+                       ", target=" + (target.empty() ? std::string("(未知)") : target));
 }
 
 // 从 sockaddr 提取纯 IP（不含端口）
@@ -1013,23 +1050,12 @@ static bool TryGetSockaddrPort(const sockaddr* addr, uint16_t* outPort) {
 // 判断 sockaddr 是否为回环地址（127.0.0.0/8 或 ::1 或 v4-mapped 127.0.0.0/8）
 static bool IsSockaddrLoopback(const sockaddr* addr) {
     if (!addr) return false;
-    if (addr->sa_family == AF_INET) {
-        const auto* addr4 = (const sockaddr_in*)addr;
-        const uint32_t ip = ntohl(addr4->sin_addr.s_addr);
-        return ((ip >> 24) == 127);
-    }
-    if (addr->sa_family == AF_INET6) {
-        const auto* addr6 = (const sockaddr_in6*)addr;
-        if (IN6_IS_ADDR_LOOPBACK(&addr6->sin6_addr)) return true;
-        if (IN6_IS_ADDR_V4MAPPED(&addr6->sin6_addr)) {
-            in_addr addr4{};
-            const unsigned char* raw = reinterpret_cast<const unsigned char*>(&addr6->sin6_addr);
-            memcpy(&addr4, raw + 12, sizeof(addr4));
-            const uint32_t ip = ntohl(addr4.s_addr);
-            return ((ip >> 24) == 127);
-        }
-    }
-    return false;
+    const int addressLength = addr->sa_family == AF_INET
+        ? static_cast<int>(sizeof(sockaddr_in))
+        : addr->sa_family == AF_INET6
+            ? static_cast<int>(sizeof(sockaddr_in6))
+            : static_cast<int>(sizeof(sockaddr));
+    return Network::IsLoopbackSockaddr(addr, addressLength);
 }
 
 // UDP 强阻断策略会触发大量重试（尤其是 QUIC），这里做简单限流，避免日志/IO 影响性能
@@ -2689,13 +2715,36 @@ SOCKET WSAAPI DetourWSASocketW(
 }
 
 int WSAAPI DetourConnect(SOCKET s, const struct sockaddr* name, int namelen) {
+    if (Network::IsLoopbackSockaddr(name, namelen)) {
+        CleanupUdpProxyContext(s);
+        ForgetSocketTarget(s);
+        const int result = fpConnect(s, name, namelen);
+        const int error = result == SOCKET_ERROR ? WSAGetLastError() : 0;
+        UpdateLocalBypassSocketAfterConnect(s, result == 0, error);
+        LogLocalTargetBypass("connect", s, SockaddrToString(name));
+        if (result == SOCKET_ERROR) WSASetLastError(error);
+        return result;
+    }
+    SetLocalBypassSocket(s, false);
     return PerformProxyConnect(s, name, namelen, false);
 }
 
 int WSAAPI DetourWSAConnect(SOCKET s, const struct sockaddr* name, int namelen, 
                             LPWSABUF lpCallerData, LPWSABUF lpCalleeData, 
                             LPQOS lpSQOS, LPQOS lpGQOS) {
-    // 忽略额外参数，使用统一的代理逻辑
+    if (Network::IsLoopbackSockaddr(name, namelen)) {
+        CleanupUdpProxyContext(s);
+        ForgetSocketTarget(s);
+        const int result = fpWSAConnect(
+            s, name, namelen, lpCallerData, lpCalleeData, lpSQOS, lpGQOS);
+        const int error = result == SOCKET_ERROR ? WSAGetLastError() : 0;
+        UpdateLocalBypassSocketAfterConnect(s, result == 0, error);
+        LogLocalTargetBypass("WSAConnect", s, SockaddrToString(name));
+        if (result == SOCKET_ERROR) WSASetLastError(error);
+        return result;
+    }
+    SetLocalBypassSocket(s, false);
+    // 外部目标沿用现有统一代理逻辑。
     return PerformProxyConnect(s, name, namelen, true);
 }
 
@@ -2703,6 +2752,10 @@ int WSAAPI DetourShutdown(SOCKET s, int how) {
     if (!fpShutdown) {
         WSASetLastError(WSAEINVAL);
         return SOCKET_ERROR;
+    }
+
+    if (IsLocalBypassSocket(s)) {
+        return fpShutdown(s, how);
     }
 
     SocketTargetInfo target{};
@@ -2739,6 +2792,14 @@ int WSAAPI DetourCloseSocket(SOCKET s) {
         return SOCKET_ERROR;
     }
 
+    if (IsLocalBypassSocket(s)) {
+        const int result = fpCloseSocket(s);
+        const int error = result == SOCKET_ERROR ? WSAGetLastError() : 0;
+        if (result == 0) SetLocalBypassSocket(s, false);
+        if (result == SOCKET_ERROR) WSASetLastError(error);
+        return result;
+    }
+
     SocketTargetInfo target{};
     const bool hasTarget = TryGetSocketTarget(s, &target);
 
@@ -2770,6 +2831,7 @@ int WSAAPI DetourCloseSocket(SOCKET s) {
 
     // 关闭成功后清理映射，避免句柄复用导致的误关联
     ForgetSocketTarget(s);
+    SetLocalBypassSocket(s, false);
 
     if (Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
         Core::Logger::Debug("closesocket: 完成, sock=" + std::to_string((unsigned long long)s));
@@ -2946,6 +3008,20 @@ BOOL WSAAPI DetourWSAConnectByNameA(
         WSASetLastError(WSAEINVAL);
         return FALSE;
     }
+    if (Network::IsLoopbackHost(node)) {
+        CleanupUdpProxyContext(s);
+        ForgetSocketTarget(s);
+        const BOOL result = fpWSAConnectByNameA(
+            s, nodename, servicename, LocalAddressLength, LocalAddress,
+            RemoteAddressLength, RemoteAddress, timeout, Reserved);
+        const int error = result ? 0 : WSAGetLastError();
+        UpdateLocalBypassSocketAfterConnect(s, result == TRUE, error);
+        LogLocalTargetBypass(
+            "WSAConnectByNameA", s, service.empty() ? node : node + ":" + service);
+        if (!result) WSASetLastError(error);
+        return result;
+    }
+    SetLocalBypassSocket(s, false);
     auto& config = Core::Config::Instance();
     if (config.proxy.port != 0 && !node.empty() && !Reserved) {
         sockaddr_storage targetAddr{};
@@ -2990,6 +3066,20 @@ BOOL WSAAPI DetourWSAConnectByNameW(
         WSASetLastError(WSAEINVAL);
         return FALSE;
     }
+    if (Network::IsLoopbackHost(node)) {
+        CleanupUdpProxyContext(s);
+        ForgetSocketTarget(s);
+        const BOOL result = fpWSAConnectByNameW(
+            s, nodename, servicename, LocalAddressLength, LocalAddress,
+            RemoteAddressLength, RemoteAddress, timeout, Reserved);
+        const int error = result ? 0 : WSAGetLastError();
+        UpdateLocalBypassSocketAfterConnect(s, result == TRUE, error);
+        LogLocalTargetBypass(
+            "WSAConnectByNameW", s, service.empty() ? node : node + ":" + service);
+        if (!result) WSASetLastError(error);
+        return result;
+    }
+    SetLocalBypassSocket(s, false);
     auto& config = Core::Config::Instance();
     if (config.proxy.port != 0 && !node.empty() && !Reserved) {
         sockaddr_storage targetAddr{};
@@ -3024,6 +3114,11 @@ int WSAAPI DetourWSAIoctl(
     LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine
 ) {
     if (!fpWSAIoctl) return SOCKET_ERROR;
+    if (IsLocalBypassSocket(s)) {
+        return fpWSAIoctl(
+            s, dwIoControlCode, lpvInBuffer, cbInBuffer, lpvOutBuffer,
+            cbOutBuffer, lpcbBytesReturned, lpOverlapped, lpCompletionRoutine);
+    }
     int result = fpWSAIoctl(s, dwIoControlCode, lpvInBuffer, cbInBuffer, lpvOutBuffer, cbOutBuffer,
                             lpcbBytesReturned, lpOverlapped, lpCompletionRoutine);
     if (result == 0 && dwIoControlCode == SIO_GET_EXTENSION_FUNCTION_POINTER &&
@@ -3138,6 +3233,22 @@ BOOL PASCAL DetourConnectEx(
         WSASetLastError(WSAEINVAL);
         return FALSE;
     }
+
+    if (Network::IsLoopbackSockaddr(name, namelen)) {
+        DropConnectExContext(lpOverlapped);
+        DropUdpOverlappedContext(lpOverlapped);
+        CleanupUdpProxyContext(s);
+        ForgetSocketTarget(s);
+        const BOOL result = originalConnectEx(
+            s, name, namelen, lpSendBuffer, dwSendDataLength,
+            lpdwBytesSent, lpOverlapped);
+        const int error = result ? 0 : WSAGetLastError();
+        UpdateLocalBypassSocketAfterConnect(s, result == TRUE, error);
+        LogLocalTargetBypass("ConnectEx", s, SockaddrToString(name));
+        if (!result) WSASetLastError(error);
+        return result;
+    }
+    SetLocalBypassSocket(s, false);
     
     // Hook 调用日志：仅在 Debug 下记录参数，避免热路径字符串拼接开销
     if (Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
@@ -3429,6 +3540,9 @@ BOOL WSAAPI DetourWSAGetOverlappedResult(
     if (!fpWSAGetOverlappedResult) {
         WSASetLastError(WSAEINVAL);
         return FALSE;
+    }
+    if (IsLocalBypassSocket(s)) {
+        return fpWSAGetOverlappedResult(s, lpOverlapped, lpcbTransfer, fWait, lpdwFlags);
     }
     BOOL result = fpWSAGetOverlappedResult(s, lpOverlapped, lpcbTransfer, fWait, lpdwFlags);
     if (result && lpOverlapped) {
@@ -3783,6 +3897,9 @@ BOOL WINAPI DetourCreateProcessA(
 // ============= Phase 3: send/recv Hook =============
 
 int WSAAPI DetourSend(SOCKET s, const char* buf, int len, int flags) {
+    if (IsLocalBypassSocket(s)) {
+        return fpSend(s, buf, len, flags);
+    }
     auto& config = Core::Config::Instance();
 
     // UDP/QUIC：若该 UDP socket 已进入 udp_mode=proxy，则需要封装为 SOCKS5 UDP 报文
@@ -3823,6 +3940,9 @@ int WSAAPI DetourSend(SOCKET s, const char* buf, int len, int flags) {
 }
 
 int WSAAPI DetourRecv(SOCKET s, char* buf, int len, int flags) {
+    if (IsLocalBypassSocket(s)) {
+        return fpRecv(s, buf, len, flags);
+    }
     auto& config = Core::Config::Instance();
 
     // UDP/QUIC：若该 UDP socket 已进入 udp_mode=proxy，则 recv 得到的是 SOCKS5 UDP Reply，需要解封装
@@ -3872,6 +3992,11 @@ int WSAAPI DetourWSASend(
     LPWSAOVERLAPPED lpOverlapped,
     LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine
 ) {
+    if (IsLocalBypassSocket(s)) {
+        return fpWSASend(
+            s, lpBuffers, dwBufferCount, lpNumberOfBytesSent,
+            dwFlags, lpOverlapped, lpCompletionRoutine);
+    }
     auto& config = Core::Config::Instance();
 
     // UDP/QUIC：connected UDP socket 可能走 WSASend，需要封装 SOCKS5 UDP 头
@@ -3971,6 +4096,11 @@ int WSAAPI DetourWSARecv(
     LPWSAOVERLAPPED lpOverlapped,
     LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine
 ) {
+    if (IsLocalBypassSocket(s)) {
+        return fpWSARecv(
+            s, lpBuffers, dwBufferCount, lpNumberOfBytesRecvd,
+            lpFlags, lpOverlapped, lpCompletionRoutine);
+    }
     auto& config = Core::Config::Instance();
 
     // UDP/QUIC：connected UDP socket 可能走 WSARecv，需要解封装 SOCKS5 UDP Reply
@@ -4074,6 +4204,9 @@ int WSAAPI DetourRecvFrom(SOCKET s, char* buf, int len, int flags, struct sockad
         WSASetLastError(WSAEINVAL);
         return SOCKET_ERROR;
     }
+    if (IsLocalBypassSocket(s)) {
+        return fpRecvFrom(s, buf, len, flags, from, fromlen);
+    }
 
     auto& config = Core::Config::Instance();
     if (config.proxy.port != 0 && GetEffectiveUdpAction(config) == Core::UdpAction::Proxy) {
@@ -4131,6 +4264,11 @@ int WSAAPI DetourWSARecvFrom(
     if (!fpWSARecvFrom) {
         WSASetLastError(WSAEINVAL);
         return SOCKET_ERROR;
+    }
+    if (IsLocalBypassSocket(s)) {
+        return fpWSARecvFrom(
+            s, lpBuffers, dwBufferCount, lpNumberOfBytesRecvd, lpFlags,
+            lpFrom, lpFromlen, lpOverlapped, lpCompletionRoutine);
     }
 
     auto& config = Core::Config::Instance();
@@ -4241,6 +4379,17 @@ int WSAAPI DetourSendTo(SOCKET s, const char* buf, int len, int flags, const str
     if (!fpSendTo) {
         WSASetLastError(WSAEINVAL);
         return SOCKET_ERROR;
+    }
+    if (to) {
+        const bool isLocalTarget = Network::IsLoopbackSockaddr(to, tolen);
+        SetLocalBypassSocket(s, isLocalTarget);
+        if (isLocalTarget) {
+            CleanupUdpProxyContext(s);
+            ForgetSocketTarget(s);
+            return fpSendTo(s, buf, len, flags, to, tolen);
+        }
+    } else if (IsLocalBypassSocket(s)) {
+        return fpSendTo(s, buf, len, flags, to, tolen);
     }
 
     auto& config = Core::Config::Instance();
@@ -4356,6 +4505,21 @@ int WSAAPI DetourWSASendTo(
     if (!fpWSASendTo) {
         WSASetLastError(WSAEINVAL);
         return SOCKET_ERROR;
+    }
+    if (lpTo) {
+        const bool isLocalTarget = Network::IsLoopbackSockaddr(lpTo, iToLen);
+        SetLocalBypassSocket(s, isLocalTarget);
+        if (isLocalTarget) {
+            CleanupUdpProxyContext(s);
+            ForgetSocketTarget(s);
+            return fpWSASendTo(
+                s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags,
+                lpTo, iToLen, lpOverlapped, lpCompletionRoutine);
+        }
+    } else if (IsLocalBypassSocket(s)) {
+        return fpWSASendTo(
+            s, lpBuffers, dwBufferCount, lpNumberOfBytesSent, dwFlags,
+            lpTo, iToLen, lpOverlapped, lpCompletionRoutine);
     }
 
     auto& config = Core::Config::Instance();
@@ -4724,6 +4888,11 @@ namespace Hooks {
             // 清理 socket -> 原始目标映射，避免卸载后残留
             std::lock_guard<std::mutex> lock(g_socketTargetsMtx);
             g_socketTargets.clear();
+        }
+        {
+            // 清理本地旁路 socket，避免 DLL 卸载后保留已失效句柄。
+            std::unique_lock<std::shared_mutex> lock(g_localBypassSocketsMtx);
+            g_localBypassSockets.clear();
         }
         {
             // 清理 ConnectEx Provider trampoline 映射，避免卸载后残留
